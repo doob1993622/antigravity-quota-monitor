@@ -1,0 +1,8 @@
+{
+  "command": "node",
+  "args": ["launch.mjs"],
+  "restart_policy": "on-failure",
+  "display_name": "模型用量桌面浮窗",
+  "description": "随 Antigravity 自动启动并在 Antigravity 关闭时自动退出的桌面迷你用量浮窗。",
+  "has_web_ui": false
+}

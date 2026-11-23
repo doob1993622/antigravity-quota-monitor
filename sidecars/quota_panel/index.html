@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>模型用量</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="topbar-main">
+        <div class="title-wrap">
+          <h1 class="title">模型用量</h1>
+          <span id="plan-badge" class="badge badge-plan hidden"></span>
+          <span id="stale-badge" class="badge badge-stale hidden" title="刷新失败，当前展示最近一次缓存数据">缓存</span>
+        </div>
+        <div class="topbar-actions">
+          <div class="seg" role="group" aria-label="显示模式">
+            <button type="button" id="mode-used" class="seg-btn active" aria-pressed="true">已用</button>
+            <button type="button" id="mode-remaining" class="seg-btn" aria-pressed="false">剩余</button>
+          </div>
+          <button
+            type="button"
+            id="refresh-btn"
+            class="icon-btn"
+            title="立即刷新用量"
+            aria-label="立即刷新用量"
+          >
+            <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M13.5 8a5.5 5.5 0 1 1-1.35-3.61" />
+              <path d="M13.5 2.5v2.75h-2.75" />
+            </svg>
+          </button>
+        </div>
+      </div>
+      <div id="updated-at" class="updated-at" aria-live="polite">正在获取配额信息…</div>
+    </header>
+
+    <main class="content">
+      <div id="loading" class="loading" aria-busy="true" aria-live="polite">
+        <div class="skel-card">
+          <div class="skel skel-title"></div>
+          <div class="skel skel-meta"></div>
+          <div class="skel skel-bar"></div>
+          <div class="skel skel-bar"></div>
+        </div>
+      </div>
+
+      <div id="error-banner" class="error-banner hidden" role="alert">
+        <div class="error-text" id="error-text"></div>
+        <button type="button" id="retry-btn" class="retry-btn">重试</button>
+      </div>
+
+      <section id="app-view" class="app-view hidden">
+        <button
+          type="button"
+          id="current-card"
+          class="current-card"
+          aria-expanded="false"
+          aria-controls="all-models"
+        >
+          <div class="card-head">
+            <div class="card-title-row">
+              <span class="current-dot" aria-hidden="true"></span>
+              <span id="current-model-name" class="current-model-name">--</span>
+            </div>
+            <div class="card-badges">
+              <span id="current-source-badge" class="pill pill-muted"></span>
+              <span id="current-group-badge" class="pill pill-accent"></span>
+            </div>
+          </div>
+
+          <div id="current-meters" class="meters"></div>
+
+          <div class="card-foot">
+            <span id="expand-hint" class="expand-hint">点击展开全部模型用量</span>
+            <svg class="chevron" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M4 6l4 4 4-4" />
+            </svg>
+          </div>
+        </button>
+
+        <section id="all-models" class="all-models hidden" aria-label="全部模型用量">
+          <div id="groups-list" class="groups-list"></div>
+          <footer id="quota-footer" class="quota-footer hidden"></footer>
+        </section>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

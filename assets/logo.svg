@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="qm-arc" x1="20" y1="96" x2="108" y2="28" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0EA5E9" />
+      <stop offset="55%" stop-color="#14B8A6" />
+      <stop offset="100%" stop-color="#22C55E" />
+    </linearGradient>
+    <linearGradient id="qm-bars" x1="40" y1="94" x2="88" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#2DD4BF" />
+    </linearGradient>
+  </defs>
+  <!-- Outer subtle track arc (~12% margin inside 128x128) -->
+  <path
+    d="M 28.1 99.9 A 48 48 0 1 1 99.9 99.9"
+    stroke="#64748B"
+    stroke-opacity="0.35"
+    stroke-width="11"
+    stroke-linecap="round"
+  />
+  <!-- Active quota gauge arc -->
+  <path
+    d="M 28.1 99.9 A 48 48 0 1 1 110.4 51.6"
+    stroke="url(#qm-arc)"
+    stroke-width="11"
+    stroke-linecap="round"
+  />
+  <!-- Usage bars inside gauge -->
+  <rect x="42" y="72" width="11" height="26" rx="4" fill="url(#qm-bars)" />
+  <rect x="58.5" y="56" width="11" height="42" rx="4" fill="url(#qm-bars)" />
+  <rect x="75" y="64" width="11" height="34" rx="4" fill="url(#qm-bars)" />
+  <!-- Accent indicator dot -->
+  <circle cx="110.4" cy="51.6" r="5" fill="#22C55E" />
+</svg>

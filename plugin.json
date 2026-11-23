@@ -1,0 +1,9 @@
+{
+  "name": "quota-monitor",
+  "displayName": "模型用量监控",
+  "description": "在边栏实时显示当前模型的 5 小时与一周配额用量，点击展开查看全部模型用量。",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg",
+  "homepage": "https://github.com/jibunrock40/antigravity-quota-monitor",
+  "repository": "https://github.com/jibunrock40/antigravity-quota-monitor"
+}
