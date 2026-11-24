@@ -58,6 +58,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLayout,
     QMenu,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -73,6 +74,7 @@ APP_DATA = Path.home() / ".gemini" / "antigravity"
 PLUGIN_DIR_NAME = Path(__file__).resolve().parent.parent.name
 SIDECAR_BASE = APP_DATA / "sidecar_data" / PLUGIN_DIR_NAME / "quota_panel"
 RUNTIME_FILE = SIDECAR_BASE / "data" / "runtime.json"
+SIDECAR_TOKEN_FILE = SIDECAR_BASE / "data" / "sidecar_token.json"
 SIDECAR_LOG = SIDECAR_BASE / "logs" / "sidecar.log"
 PREFS_FILE = SIDECAR_BASE / "data" / "widget_prefs.json"
 WIDGET_LOG = SIDECAR_BASE / "data" / "widget.log"
@@ -89,9 +91,9 @@ POPOVER_VIS_WIDTH = 332
 POLL_OK_MS = 30_000
 POLL_RETRY_MS = 5_000
 POLL_INIT_RETRY_MS = 2_000
-TRACK_MS = 150
+TRACK_MS = 60
 TICK_MS = 30_000
-LIFECYCLE_MS = 1_500
+LIFECYCLE_MS = 1_000
 APP_GONE_GRACE_SEC = 3.0
 
 DEFAULT_PREFS = {
@@ -309,22 +311,45 @@ def tone_color_key(used_pct: float) -> str:
 # ---------------------------------------------------------------------------
 class SidecarQuotaClient(QObject):
     quota_fetched = pyqtSignal(object, object)  # (payload_dict | None, error_str | None)
+    accounts_fetched = pyqtSignal(object, object)  # (accounts_dict | None, error_str | None)
+    account_action_done = pyqtSignal(str, bool, object, object)  # (action, ok, payload, err)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._conv_cache = (0.0, "")
         self._lock = threading.Lock()
         self._fetching = False
+        self._fetching_accounts = False
+        self._no_proxy_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def discover_ports(self) -> list[int]:
-        ports: list[int] = []
-        # 1. Primary: runtime.json written by main.mjs
+    @staticmethod
+    def _read_token_file(path: Path) -> str:
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                tok = data.get("token")
+                if isinstance(tok, str) and tok:
+                    return tok
+        except Exception:
+            pass
+        return ""
+
+    def _discover_endpoints(self) -> list[tuple[int, str]]:
+        endpoints: list[tuple[int, str]] = []
+        seen_ports: set[int] = set()
+        fallback_tok = self._read_sidecar_token()
+
+        def add_candidate(port_val, tok_val: str = "") -> None:
+            if isinstance(port_val, int) and 0 < port_val < 65536 and port_val not in seen_ports:
+                seen_ports.add(port_val)
+                endpoints.append((port_val, tok_val or fallback_tok))
+
+        # 1. Primary: runtime.json + sibling sidecar_token.json written by main.mjs
+        primary_tok = self._read_token_file(SIDECAR_TOKEN_FILE) or fallback_tok
         try:
             if RUNTIME_FILE.exists():
                 rt = json.loads(RUNTIME_FILE.read_text(encoding="utf-8"))
-                p = rt.get("port")
-                if isinstance(p, int) and 0 < p < 65536:
-                    ports.append(p)
+                add_candidate(rt.get("port"), primary_tok)
         except Exception:
             pass
 
@@ -335,41 +360,56 @@ class SidecarQuotaClient(QObject):
                 for line in reversed(lines):
                     m = LOG_PORT_RE.search(line)
                     if m:
-                        p = int(m.group(1))
-                        if 0 < p < 65536 and p not in ports:
-                            ports.append(p)
+                        add_candidate(int(m.group(1)), primary_tok)
                         break
         except Exception:
             pass
 
         # 3. Fallback: scan any installed plugin directory name under sidecar_data/*/quota_panel
-        if not ports:
-            sidecar_root = APP_DATA / "sidecar_data"
-            try:
-                for rt_file in sidecar_root.glob("*/quota_panel/data/runtime.json"):
-                    try:
-                        rt = json.loads(rt_file.read_text(encoding="utf-8"))
-                        p = rt.get("port")
-                        if isinstance(p, int) and 0 < p < 65536 and p not in ports:
-                            ports.append(p)
-                    except Exception:
-                        pass
+        sidecar_root = APP_DATA / "sidecar_data"
+        try:
+            for rt_file in sidecar_root.glob("*/quota_panel/data/runtime.json"):
+                try:
+                    rt = json.loads(rt_file.read_text(encoding="utf-8"))
+                    sib_tok = self._read_token_file(rt_file.parent / "sidecar_token.json")
+                    add_candidate(rt.get("port"), sib_tok)
+                except Exception:
+                    pass
+            if not endpoints:
                 for log_file in sidecar_root.glob("*/quota_panel/logs/sidecar.log"):
                     try:
+                        sib_tok = self._read_token_file(log_file.parent.parent / "data" / "sidecar_token.json")
                         lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
                         for line in reversed(lines):
                             m = LOG_PORT_RE.search(line)
                             if m:
-                                p = int(m.group(1))
-                                if 0 < p < 65536 and p not in ports:
-                                    ports.append(p)
+                                add_candidate(int(m.group(1)), sib_tok)
                                 break
                     except Exception:
                         pass
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-        return ports
+        return endpoints
+
+    def discover_ports(self) -> list[int]:
+        return [p for p, _ in self._discover_endpoints()]
+
+    def _read_sidecar_token(self) -> str:
+        candidates = [SIDECAR_TOKEN_FILE]
+        sidecar_root = APP_DATA / "sidecar_data"
+        try:
+            for tok_file in sidecar_root.glob("*/quota_panel/data/sidecar_token.json"):
+                if tok_file not in candidates:
+                    candidates.append(tok_file)
+        except Exception:
+            pass
+
+        for path in candidates:
+            tok = self._read_token_file(path)
+            if tok:
+                return tok
+        return ""
 
     def find_latest_conversation_id(self) -> str:
         now = time.monotonic()
@@ -399,11 +439,55 @@ class SidecarQuotaClient(QObject):
         self._conv_cache = (now, best_id)
         return best_id
 
-    def fetch_quota_sync(self, force: bool = False) -> tuple[dict | None, str | None, int | None]:
-        ports = self.discover_ports()
-        if not ports:
+    def _request_json(
+        self,
+        path: str,
+        method: str = "GET",
+        body: dict | None = None,
+        timeout: float = 6.0,
+    ) -> tuple[dict | None, str | None, int | None]:
+        endpoints = self._discover_endpoints()
+        if not endpoints:
             return None, "未检测到 Sidecar 端口，请确认 Antigravity 已启动", None
 
+        is_write = method.upper() != "GET"
+        data_bytes = json.dumps(body or {}).encode("utf-8") if is_write else None
+
+        last_err = None
+        last_port = None
+        total = len(endpoints)
+        for idx, (port, port_token) in enumerate(endpoints):
+            url = f"http://127.0.0.1:{port}{path}"
+            headers = {}
+            if is_write:
+                headers["Content-Type"] = "application/json"
+                tok = port_token or self._read_sidecar_token()
+                if tok:
+                    headers["X-Sidecar-Token"] = tok
+            try:
+                req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method.upper())
+                with self._no_proxy_opener.open(req, timeout=timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                    payload = json.loads(raw) if raw else {}
+                    return payload, payload.get("error"), port
+            except urllib.error.HTTPError as exc:
+                try:
+                    err_body = json.loads(exc.read().decode("utf-8"))
+                    err_msg = err_body.get("error") or f"HTTP {exc.code}"
+                except Exception:
+                    err_msg = f"HTTP {exc.code}"
+                if exc.code in (401, 404, 405, 502, 503) and idx + 1 < total:
+                    last_err = err_msg
+                    last_port = port
+                    continue
+                return None, err_msg, port
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+                last_err = str(exc)
+                last_port = port
+
+        return None, last_err or "无法连接到本地 Sidecar 服务", last_port
+
+    def fetch_quota_sync(self, force: bool = False) -> tuple[dict | None, str | None, int | None]:
         conv_id = self.find_latest_conversation_id()
         qs = {}
         if conv_id:
@@ -411,25 +495,13 @@ class SidecarQuotaClient(QObject):
         if force:
             qs["force"] = "1"
         query = urllib.parse.urlencode(qs)
+        path = f"/api/quota?{query}" if query else "/api/quota"
+        return self._request_json(path, method="GET", timeout=5.0)
 
-        last_err = None
-        for port in ports:
-            url = f"http://127.0.0.1:{port}/api/quota"
-            if query:
-                url = f"{url}?{query}"
-            try:
-                req = urllib.request.Request(url, method="GET")
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
-                    if resp.status != 200:
-                        last_err = f"HTTP {resp.status}"
-                        continue
-                    body = resp.read().decode("utf-8")
-                    payload = json.loads(body)
-                    return payload, payload.get("error"), port
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
-                last_err = str(exc)
-
-        return None, last_err or "无法连接到本地 Sidecar 服务", None
+    def fetch_accounts_sync(self) -> tuple[dict | None, str | None, int | None]:
+        conv_id = self.find_latest_conversation_id()
+        path = f"/api/accounts?conversationId={urllib.parse.quote(conv_id)}" if conv_id else "/api/accounts"
+        return self._request_json(path, method="GET", timeout=5.0)
 
     def request_fetch(self, force: bool = False) -> None:
         with self._lock:
@@ -447,6 +519,47 @@ class SidecarQuotaClient(QObject):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def request_fetch_accounts(self) -> None:
+        with self._lock:
+            if self._fetching_accounts:
+                return
+            self._fetching_accounts = True
+
+        def worker():
+            try:
+                payload, err, _ = self.fetch_accounts_sync()
+            finally:
+                with self._lock:
+                    self._fetching_accounts = False
+            self.accounts_fetched.emit(payload, err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def request_account_action(self, action_name: str, path: str, body: dict | None = None) -> None:
+        conv_id = self.find_latest_conversation_id()
+        payload_body = dict(body or {})
+        if conv_id and "conversationId" not in payload_body:
+            payload_body["conversationId"] = conv_id
+        log_event(f"account_action_start action={action_name}")
+
+        def worker():
+            payload, err, port = self._request_json(path, method="POST", body=payload_body, timeout=12.0)
+            ok = payload is not None and not err and payload.get("ok") is not False
+            safe_err = (err or "").replace("\r", " ").replace("\n", " ")[:120]
+            log_event(f"account_action_done action={action_name} ok={ok} port={port} err={safe_err or 'none'}")
+            self.account_action_done.emit(action_name, ok, payload, err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def request_capture_account(self) -> None:
+        self.request_account_action("capture", "/api/accounts/capture")
+
+    def request_import_agy_switch(self) -> None:
+        self.request_account_action("import_agy", "/api/accounts/import-agy-switch")
+
+    def request_switch_account(self, account_id: str) -> None:
+        self.request_account_action("switch", "/api/accounts/switch", {"id": account_id})
+
 
 # ---------------------------------------------------------------------------
 # Win32 Window & HiDPI Coordinate Tracker
@@ -463,8 +576,19 @@ class MONITORINFOEXW(ctypes.Structure):
 
 class Win32WindowTracker:
     DWMWA_EXTENDED_FRAME_BOUNDS = 9
+    DWMWA_CLOAKED = 14
     MONITOR_DEFAULTTONEAREST = 2
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    GWL_EXSTYLE = -20
+    WS_EX_TOPMOST = 0x00000008
+    WS_EX_TRANSPARENT = 0x00000020
+    WS_EX_LAYERED = 0x00080000
+    HWND_TOP = 0
+    HWND_TOPMOST = -1
+    HWND_NOTOPMOST = -2
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_NOACTIVATE = 0x0010
 
     def __init__(self):
         self.user32 = ctypes.windll.user32
@@ -476,10 +600,24 @@ class Win32WindowTracker:
 
         self.user32.EnumWindows.argtypes = [self.WNDENUMPROC, wintypes.LPARAM]
         self.user32.EnumWindows.restype = wintypes.BOOL
+        self.user32.IsWindow.argtypes = [wintypes.HWND]
+        self.user32.IsWindow.restype = wintypes.BOOL
         self.user32.IsWindowVisible.argtypes = [wintypes.HWND]
         self.user32.IsWindowVisible.restype = wintypes.BOOL
         self.user32.IsIconic.argtypes = [wintypes.HWND]
         self.user32.IsIconic.restype = wintypes.BOOL
+        self.user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        self.user32.GetWindowLongW.restype = ctypes.c_long
+        self.user32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        self.user32.SetWindowPos.restype = wintypes.BOOL
         self.user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
         self.user32.GetWindowTextLengthW.restype = ctypes.c_int
         self.user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
@@ -668,6 +806,199 @@ class Win32WindowTracker:
             dpr = 1.0
         return round(phys_x / dpr), round(phys_y / dpr), default_screen, dpr, (0, 0)
 
+    def is_valid_hwnd(self, hwnd: int) -> bool:
+        return bool(hwnd and self.user32.IsWindow(hwnd))
+
+    def is_window_topmost(self, hwnd: int) -> bool:
+        if not self.is_valid_hwnd(hwnd):
+            return False
+        return bool(self.user32.GetWindowLongW(hwnd, self.GWL_EXSTYLE) & self.WS_EX_TOPMOST)
+
+    def is_window_cloaked(self, hwnd: int) -> bool:
+        if not hwnd or self.dwmapi is None:
+            return False
+        cloaked = wintypes.DWORD(0)
+        hr = self.dwmapi.DwmGetWindowAttribute(
+            hwnd,
+            self.DWMWA_CLOAKED,
+            ctypes.byref(cloaked),
+            ctypes.sizeof(cloaked),
+        )
+        return hr == 0 and int(cloaked.value) != 0
+
+    def set_topmost(self, hwnd: int, topmost: bool) -> None:
+        if not self.is_valid_hwnd(hwnd):
+            return
+        flags = self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOACTIVATE
+        if topmost:
+            self.user32.SetWindowPos(hwnd, self.HWND_TOPMOST, 0, 0, 0, 0, flags)
+        elif self.is_window_topmost(hwnd):
+            self.user32.SetWindowPos(hwnd, self.HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+
+    @staticmethod
+    def _rects_intersect(
+        a: tuple[int, int, int, int],
+        b: tuple[int, int, int, int],
+    ) -> bool:
+        return not (a[2] <= b[0] or a[0] >= b[2] or a[3] <= b[1] or a[1] >= b[3])
+
+    def sync_docked_zorder(
+        self,
+        mini_hwnd: int,
+        pop_hwnd: int,
+        pop_visible: bool,
+        agy_hwnd: int,
+        card_phys_rect: tuple[int, int, int, int] | None = None,
+        raise_for_popover: bool = False,
+        ignore_own_pid: bool = True,
+    ) -> bool:
+        """
+        Keeps `mini_hwnd` (and `pop_hwnd` when visible) glued above `agy_hwnd`:
+        - When NO other normal window is in front of `Antigravity` (or the user is
+          actively interacting with the expanded popover), promotes our widget to
+          `HWND_TOPMOST` so Windows Foreground Lock never lets `Antigravity` cover it.
+        - As soon as any other non-minimized, uncloaked window (e.g. QQ, Clash, WeChat)
+          is stacked above `Antigravity`, clears `HWND_TOPMOST` and inserts our widget
+          directly below that window and above `agy_hwnd`.
+        """
+        if not self.is_valid_hwnd(mini_hwnd) or not self.is_valid_hwnd(agy_hwnd):
+            return True
+
+        flags = self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOACTIVATE
+        agy_topmost = self.is_window_topmost(agy_hwnd)
+        agy_pid = self.get_pid(agy_hwnd) if ignore_own_pid else 0
+        has_pop = bool(pop_visible and self.is_valid_hwnd(pop_hwnd))
+
+        seq = [0]
+        mini_idx: list[int | None] = [None]
+        pop_idx: list[int | None] = [None]
+        agy_idx: list[int | None] = [None]
+        above_others: list[tuple[int, int, tuple[int, int, int, int]]] = []
+
+        def enum_cb(w, _lparam):
+            wh = int(w)
+            if wh == mini_hwnd:
+                mini_idx[0] = seq[0]
+                seq[0] += 1
+                return True
+            if has_pop and wh == pop_hwnd:
+                pop_idx[0] = seq[0]
+                seq[0] += 1
+                return True
+            if wh == agy_hwnd:
+                agy_idx[0] = seq[0]
+                return False
+
+            if not self.user32.IsWindowVisible(wh) or self.is_iconic(wh):
+                return True
+            w_pid = self.get_pid(wh)
+            if ignore_own_pid and w_pid == self.own_pid:
+                return True
+
+            ex_style = self.user32.GetWindowLongW(wh, self.GWL_EXSTYLE)
+            w_topmost = bool(ex_style & self.WS_EX_TOPMOST)
+            if not agy_topmost and w_topmost:
+                return True
+            if (ex_style & self.WS_EX_LAYERED) and (ex_style & self.WS_EX_TRANSPARENT):
+                return True
+
+            cls = self.get_class_name(wh)
+            if cls in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+                return True
+            if self.is_window_cloaked(wh):
+                return True
+
+            rect = self.get_window_rect(wh)
+            if not rect or (rect[2] - rect[0]) < 24 or (rect[3] - rect[1]) < 24:
+                return True
+
+            if agy_pid and w_pid == agy_pid:
+                if not card_phys_rect or not self._rects_intersect(rect, card_phys_rect):
+                    return True
+
+            above_others.append((seq[0], wh, rect))
+            seq[0] += 1
+            return True
+
+        self.user32.EnumWindows(self.WNDENUMPROC(enum_cb), 0)
+        if agy_idx[0] is None:
+            return True
+
+        m_i = mini_idx[0]
+        p_i = pop_idx[0]
+        a_i = agy_idx[0]
+
+        # When Antigravity is at the front (no other normal window above it), or user is
+        # actively interacting with the open popover, use HWND_TOPMOST to bypass Win32's
+        # cross-process foreground Z-order lock so Antigravity itself never covers us.
+        if not above_others or raise_for_popover:
+            mini_top = self.is_window_topmost(mini_hwnd)
+            if has_pop:
+                pop_top = self.is_window_topmost(pop_hwnd)
+                order_ok = p_i is not None and m_i is not None and p_i < m_i < a_i
+                if not (mini_top and pop_top and order_ok):
+                    self.user32.SetWindowPos(mini_hwnd, self.HWND_TOPMOST, 0, 0, 0, 0, flags)
+                    self.user32.SetWindowPos(pop_hwnd, self.HWND_TOPMOST, 0, 0, 0, 0, flags)
+            else:
+                order_ok = m_i is not None and m_i < a_i
+                if not (mini_top and order_ok):
+                    self.user32.SetWindowPos(mini_hwnd, self.HWND_TOPMOST, 0, 0, 0, 0, flags)
+            return True
+
+        # One or more normal windows (QQ, Clash, WeChat, etc.) are above Antigravity:
+        # drop HWND_TOPMOST (unless Antigravity itself is topmost) and sandwich below them.
+        mini_top = self.is_window_topmost(mini_hwnd)
+        pop_top = self.is_window_topmost(pop_hwnd) if has_pop else False
+        band_mismatch = (mini_top != agy_topmost) or (has_pop and pop_top != agy_topmost)
+
+        last_other_seq = above_others[-1][0]
+        if has_pop:
+            already_sandwiched = (
+                not band_mismatch
+                and p_i is not None
+                and m_i is not None
+                and last_other_seq < p_i < m_i < a_i
+            )
+        else:
+            already_sandwiched = not band_mismatch and m_i is not None and last_other_seq < m_i < a_i
+
+        if already_sandwiched:
+            return True
+
+        if not agy_topmost:
+            if mini_top:
+                self.user32.SetWindowPos(mini_hwnd, self.HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+            if has_pop and pop_top:
+                self.user32.SetWindowPos(pop_hwnd, self.HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+        else:
+            if not mini_top:
+                self.user32.SetWindowPos(mini_hwnd, self.HWND_TOPMOST, 0, 0, 0, 0, flags)
+            if has_pop and not pop_top:
+                self.user32.SetWindowPos(pop_hwnd, self.HWND_TOPMOST, 0, 0, 0, 0, flags)
+
+        for i in range(len(above_others) - 1, -1, -1):
+            _, anchor_hwnd, _ = above_others[i]
+            if has_pop:
+                ok1 = bool(self.user32.SetWindowPos(pop_hwnd, anchor_hwnd, 0, 0, 0, 0, flags))
+                ok2 = bool(self.user32.SetWindowPos(mini_hwnd, pop_hwnd, 0, 0, 0, 0, flags)) if ok1 else False
+                placed = ok1 and ok2
+            else:
+                placed = bool(self.user32.SetWindowPos(mini_hwnd, anchor_hwnd, 0, 0, 0, 0, flags))
+
+            if placed:
+                if card_phys_rect:
+                    for _, _wh, skipped_rect in above_others[i + 1 :]:
+                        if self._rects_intersect(skipped_rect, card_phys_rect):
+                            return False
+                return True
+
+        # Fallback if every window above Antigravity rejected SetWindowPos (e.g. elevated UIPI)
+        if card_phys_rect:
+            for _, _wh, r in above_others:
+                if self._rects_intersect(r, card_phys_rect):
+                    return False
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Custom Qt Widgets & Layouts
@@ -828,8 +1159,9 @@ class MiniQuotaCard(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Antigravity Quota")
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setCursor(Qt.PointingHandCursor)
 
         self._dock_mode = "docked"
@@ -1141,20 +1473,32 @@ class MiniQuotaCard(QWidget):
 
 
 class ExpandedPopover(QWidget):
-    """Expanded floating card displaying all model groups and family chips."""
+    """Expanded floating card displaying all model groups and local account switching."""
 
     closed_requested = pyqtSignal()
     mode_toggled = pyqtSignal()
     refresh_requested = pyqtSignal()
+    tab_changed = pyqtSignal(str)
+    size_changed = pyqtSignal()
+    capture_account_requested = pyqtSignal()
+    import_agy_switch_requested = pyqtSignal()
+    switch_account_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("全部模型用量")
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
         self._theme = "light"
         self._mode = "used"
+        self._active_tab = "quota"
+        self._payload: dict | None = None
+        self._accounts_data: dict | None = None
+        self._action_banner: tuple[str, str] | None = None
+        self._confirm_switch_acc: dict | None = None
+        self._busy_action: str | None = None
+        self._render_pending = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN)
@@ -1174,7 +1518,7 @@ class ExpandedPopover(QWidget):
         head.setContentsMargins(0, 0, 0, 0)
         head.setSpacing(6)
 
-        self.title_lbl = QLabel("全部模型用量")
+        self.title_lbl = QLabel("模型与账号")
         head.addWidget(self.title_lbl)
 
         self.plan_lbl = QLabel("")
@@ -1192,7 +1536,7 @@ class ExpandedPopover(QWidget):
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.setFixedSize(36, 20)
         self.refresh_btn.setCursor(Qt.PointingHandCursor)
-        self.refresh_btn.setToolTip("立即刷新配额")
+        self.refresh_btn.setToolTip("立即刷新配额与账号状态")
         self.refresh_btn.clicked.connect(self.refresh_requested.emit)
         head.addWidget(self.refresh_btn)
 
@@ -1209,7 +1553,25 @@ class ExpandedPopover(QWidget):
         self.head_line.setFixedHeight(1)
         root.addWidget(self.head_line)
 
-        # Groups container (wrapped in borderless scroll area only when exceeding screen height)
+        # Segmented tab switcher: 模型配额 | 账号切换
+        self.tab_bar = QFrame()
+        self.tab_bar.setObjectName("popoverTabBar")
+        tab_lay = QHBoxLayout(self.tab_bar)
+        tab_lay.setContentsMargins(3, 3, 3, 3)
+        tab_lay.setSpacing(4)
+
+        self.tab_quota_btn = QPushButton("模型配额")
+        self.tab_quota_btn.setCursor(Qt.PointingHandCursor)
+        self.tab_quota_btn.clicked.connect(lambda: self._select_tab("quota"))
+        tab_lay.addWidget(self.tab_quota_btn, 1)
+
+        self.tab_accounts_btn = QPushButton("账号切换 (0)")
+        self.tab_accounts_btn.setCursor(Qt.PointingHandCursor)
+        self.tab_accounts_btn.clicked.connect(lambda: self._select_tab("accounts"))
+        tab_lay.addWidget(self.tab_accounts_btn, 1)
+        root.addWidget(self.tab_bar)
+
+        # Groups / accounts container (wrapped in borderless scroll area)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.NoFrame)
@@ -1241,6 +1603,95 @@ class ExpandedPopover(QWidget):
     def visible_size(self) -> tuple[int, int]:
         return self.surface.width(), self.surface.height()
 
+    def has_active_account_interaction(self) -> bool:
+        return self._active_tab == "accounts" and (
+            self._confirm_switch_acc is not None or self._busy_action is not None
+        )
+
+    def _schedule_render(self) -> None:
+        if not self.isVisible():
+            self._render_current_tab()
+            return
+        if self._render_pending:
+            return
+        self._render_pending = True
+        QTimer.singleShot(0, self._flush_scheduled_render)
+
+    def _flush_scheduled_render(self) -> None:
+        self._render_pending = False
+        self._render_current_tab()
+
+    def _select_tab(self, tab: str) -> None:
+        if tab not in ("quota", "accounts"):
+            return
+        if self._active_tab != tab:
+            self._active_tab = tab
+            self._confirm_switch_acc = None
+            self._apply_tab_styles()
+            self._schedule_render()
+            self.tab_changed.emit(tab)
+
+    def set_active_tab(self, tab: str) -> None:
+        if tab in ("quota", "accounts"):
+            self._active_tab = tab
+            self._confirm_switch_acc = None
+            self._apply_tab_styles()
+            self._render_current_tab()
+
+    def set_action_banner(self, kind: str | None, text: str | None) -> None:
+        self._action_banner = (kind, text) if (kind and text) else None
+        if self._active_tab == "accounts":
+            self._schedule_render()
+
+    def set_busy_action(self, action: str | None) -> None:
+        self._busy_action = action
+        if self._active_tab == "accounts":
+            self._schedule_render()
+
+    def refresh_timestamps(
+        self,
+        payload: dict | None = None,
+        accounts_data: dict | None = None,
+    ) -> None:
+        if payload is not None:
+            self._payload = payload
+        if accounts_data is not None:
+            self._accounts_data = accounts_data
+        acc_count = len((self._accounts_data or {}).get("accounts") or [])
+        self.tab_accounts_btn.setText(f"账号切换 ({acc_count})")
+        if self._payload:
+            plan_name = (
+                (self._payload.get("tier") or {}).get("planName")
+                or (self._payload.get("tier") or {}).get("name")
+                or ""
+            )
+            if plan_name:
+                self.plan_lbl.setText(plan_name)
+                self.plan_lbl.setVisible(True)
+            else:
+                self.plan_lbl.setVisible(False)
+            self.foot_time.setText(fmt_relative_updated(self._payload.get("fetchedAt")))
+        else:
+            self.plan_lbl.setVisible(False)
+            self.foot_time.setText("")
+
+    def _apply_tab_styles(self) -> None:
+        pal = PALETTES[self._theme]
+        self.tab_bar.setStyleSheet(
+            f"#popoverTabBar {{ background: {pal['card_alt']}; border: 1px solid {pal['border']}; border-radius: 7px; }}"
+        )
+        active_css = (
+            f"QPushButton {{ background: {pal['card_bg']}; color: {pal['fg']}; border: none; "
+            f"border-radius: 5px; padding: 3px 8px; font-size: 11.5px; font-weight: 600; }}"
+        )
+        idle_css = (
+            f"QPushButton {{ background: transparent; color: {pal['muted']}; border: none; "
+            f"border-radius: 5px; padding: 3px 8px; font-size: 11.5px; font-weight: 500; }}"
+            f"QPushButton:hover {{ color: {pal['fg']}; }}"
+        )
+        self.tab_quota_btn.setStyleSheet(active_css if self._active_tab == "quota" else idle_css)
+        self.tab_accounts_btn.setStyleSheet(active_css if self._active_tab == "accounts" else idle_css)
+
     def apply_theme(self, theme: str) -> None:
         self._theme = theme
         pal = PALETTES[theme]
@@ -1265,6 +1716,7 @@ class ExpandedPopover(QWidget):
         self.head_line.setStyleSheet(f"background: {pal['border']}; border: none;")
         self.foot_note.setStyleSheet(f"color: {pal['muted']}; font-size: 11px;")
         self.foot_time.setStyleSheet(f"color: {pal['muted']}; font-size: 11px;")
+        self._apply_tab_styles()
 
     def _clear_groups(self) -> None:
         while self.groups_layout.count():
@@ -1275,38 +1727,368 @@ class ExpandedPopover(QWidget):
                 w.setParent(None)
                 w.deleteLater()
 
-    def update_data(self, payload: dict | None, mode: str) -> None:
+    def update_data(
+        self,
+        payload: dict | None,
+        mode: str,
+        accounts_data: dict | None = None,
+    ) -> None:
+        self._payload = payload
         self._mode = mode
-        pal = PALETTES[self._theme]
-        self.mode_btn.setText("已用视角" if mode == "used" else "剩余视角")
+        if accounts_data is not None:
+            self._accounts_data = accounts_data
 
-        if not payload:
-            self._clear_groups()
+        self.mode_btn.setText("已用视角" if mode == "used" else "剩余视角")
+        acc_count = len((self._accounts_data or {}).get("accounts") or [])
+        self.tab_accounts_btn.setText(f"账号切换 ({acc_count})")
+
+        if payload:
+            plan_name = (payload.get("tier") or {}).get("planName") or (payload.get("tier") or {}).get("name") or ""
+            if plan_name:
+                self.plan_lbl.setText(plan_name)
+                self.plan_lbl.setVisible(True)
+            else:
+                self.plan_lbl.setVisible(False)
+            self.foot_time.setText(fmt_relative_updated(payload.get("fetchedAt")))
+        else:
+            self.plan_lbl.setVisible(False)
+            self.foot_time.setText("")
+
+        self._render_current_tab()
+
+    def _render_current_tab(self) -> None:
+        if self._active_tab == "accounts":
+            self.foot_note.setText("纯本地快照 · 切换将重启 Antigravity")
+            self._render_accounts_tab()
+        else:
+            self.foot_note.setText("同组模型共享 5h 与一周配额")
+            self._render_quota_tab()
+
+    def _render_quota_tab(self) -> None:
+        pal = PALETTES[self._theme]
+        self._clear_groups()
+        if not self._payload:
             empty = QLabel("暂未获取到配额数据")
             empty.setStyleSheet(f"color: {pal['muted']}; font-size: 12px; padding: 12px 0;")
             self.groups_layout.addWidget(empty)
-            self.plan_lbl.setVisible(False)
-            self.foot_time.setText("")
             self._resize_popover()
             return
 
-        plan_name = (payload.get("tier") or {}).get("planName") or (payload.get("tier") or {}).get("name") or ""
-        if plan_name:
-            self.plan_lbl.setText(plan_name)
-            self.plan_lbl.setVisible(True)
-        else:
-            self.plan_lbl.setVisible(False)
-
-        self.foot_time.setText(fmt_relative_updated(payload.get("fetchedAt")))
-
-        self._clear_groups()
-        groups = payload.get("groups") or []
+        groups = self._payload.get("groups") or []
         for g in groups:
-            self.groups_layout.addWidget(self._build_group_card(g, mode))
-
+            self.groups_layout.addWidget(self._build_group_card(g, self._mode))
         self._resize_popover()
 
+    def _render_accounts_tab(self) -> None:
+        pal = PALETTES[self._theme]
+        self._clear_groups()
+
+        acc_data = self._accounts_data or {}
+        accounts = acc_data.get("accounts") or []
+        live = acc_data.get("liveAccount") or (self._payload or {}).get("account") or {}
+        live_email = (live or {}).get("email") or ""
+        current_saved = next((a for a in accounts if a.get("isCurrent")), None)
+
+        # 1. Active account + quick action card
+        active_card = QFrame()
+        active_card.setObjectName("accountActiveCard")
+        active_card.setStyleSheet(
+            f"#accountActiveCard {{ background: {pal['card_alt']}; border: 1px solid {pal['border']}; border-radius: 9px; }}"
+        )
+        a_lay = QVBoxLayout(active_card)
+        a_lay.setContentsMargins(9, 8, 9, 8)
+        a_lay.setSpacing(6)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(6)
+        cur_title = QLabel(
+            (current_saved.get("remark") + f" ({current_saved.get('email')})")
+            if current_saved and current_saved.get("remark")
+            else (current_saved.get("email") if current_saved else (live_email or "未检测到在线账号"))
+        )
+        cur_title.setStyleSheet(f"color: {pal['fg']}; font-size: 12px; font-weight: 600;")
+        cur_title.setWordWrap(True)
+        top_row.addWidget(cur_title, 1)
+
+        if current_saved:
+            badge_txt = current_saved.get("tier") or "已保存"
+            top_row.addWidget(make_pill_label(badge_txt, pal["accent_soft"], pal["accent"], bold=True))
+        elif live_email:
+            top_row.addWidget(make_pill_label("未保存", pal["card_bg"], pal["muted"], bold=False))
+        a_lay.addLayout(top_row)
+
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(6)
+
+        primary_btn_css = (
+            f"QPushButton {{ background: {pal['accent']}; color: {pal['accent_fg']}; border: none; "
+            f"border-radius: 5px; padding: 4px 8px; font-size: 11px; font-weight: 600; }}"
+            f"QPushButton:disabled {{ opacity: 0.55; }}"
+        )
+        sec_btn_css = (
+            f"QPushButton {{ background: {pal['card_bg']}; color: {pal['fg']}; border: 1px solid {pal['border']}; "
+            f"border-radius: 5px; padding: 4px 8px; font-size: 11px; font-weight: 500; }}"
+            f"QPushButton:hover {{ background: {pal['hover']}; }}"
+            f"QPushButton:disabled {{ opacity: 0.55; }}"
+        )
+
+        save_btn = QPushButton("更新当前凭据" if current_saved else "保存当前账号")
+        save_btn.setCursor(Qt.PointingHandCursor)
+        save_btn.setStyleSheet(primary_btn_css)
+        save_btn.setEnabled(self._busy_action is None)
+        save_btn.clicked.connect(self.capture_account_requested.emit)
+        btn_row.addWidget(save_btn)
+
+        agy_cnt = int(acc_data.get("agySwitchCount") or 0)
+        imp_label = f"导入 agy-switch ({agy_cnt})" if agy_cnt > 0 else "导入 agy-switch"
+        imp_btn = QPushButton(imp_label)
+        imp_btn.setCursor(Qt.PointingHandCursor)
+        imp_btn.setStyleSheet(sec_btn_css)
+        imp_btn.setEnabled(self._busy_action is None)
+        imp_btn.clicked.connect(self.import_agy_switch_requested.emit)
+        btn_row.addWidget(imp_btn)
+        a_lay.addLayout(btn_row)
+        self.groups_layout.addWidget(active_card)
+
+        # 2. Action feedback or failed switch status banner
+        banner = self._action_banner
+        if not banner:
+            sw_status = acc_data.get("switchStatus") or {}
+            if sw_status.get("state") == "failed" and sw_status.get("error"):
+                banner = ("error", f"上次切换失败: {sw_status['error']}")
+        if banner:
+            b_kind, b_text = banner
+            b_col = pal["red"] if b_kind == "error" else (pal["green"] if b_kind == "success" else pal["accent"])
+            banner_lbl = QLabel(b_text)
+            banner_lbl.setWordWrap(True)
+            banner_lbl.setStyleSheet(
+                f"background: {pal['card_alt']}; color: {b_col}; border: 1px solid {b_col}; "
+                f"border-radius: 7px; padding: 6px 8px; font-size: 11px;"
+            )
+            self.groups_layout.addWidget(banner_lbl)
+
+        # 3. Fallback switch confirmation box (when target is outside current list)
+        confirm_id = (self._confirm_switch_acc or {}).get("id") or ""
+        matched_in_list = any(a.get("id") == confirm_id for a in accounts) if confirm_id else False
+        if self._confirm_switch_acc and not matched_in_list:
+            target = self._confirm_switch_acc
+            conf = QFrame()
+            conf.setObjectName("switchConfirmBox")
+            conf.setStyleSheet(
+                f"#switchConfirmBox {{ background: {pal['card_bg']}; border: 1px solid {pal['amber']}; border-radius: 9px; }}"
+            )
+            c_lay = QVBoxLayout(conf)
+            c_lay.setContentsMargins(9, 8, 9, 8)
+            c_lay.setSpacing(6)
+            t_lbl = QLabel(f"确认切换到 {target.get('email', '')}？")
+            t_lbl.setWordWrap(True)
+            t_lbl.setStyleSheet(f"color: {pal['fg']}; font-size: 11.5px; font-weight: 600;")
+            c_lay.addWidget(t_lbl)
+            w_lbl = QLabel("将关闭并重启 Antigravity（同步更新 agy CLI），进行中的任务不会迁移。")
+            w_lbl.setWordWrap(True)
+            w_lbl.setStyleSheet(f"color: {pal['amber']}; font-size: 11px;")
+            c_lay.addWidget(w_lbl)
+
+            c_btns = QHBoxLayout()
+            c_btns.setContentsMargins(0, 0, 0, 0)
+            c_btns.setSpacing(6)
+            c_btns.addStretch(1)
+            cancel_b = QPushButton("取消")
+            cancel_b.setCursor(Qt.PointingHandCursor)
+            cancel_b.setStyleSheet(sec_btn_css)
+            cancel_b.clicked.connect(self._cancel_confirm_switch)
+            c_btns.addWidget(cancel_b)
+
+            ok_b = QPushButton("确认重启切换")
+            ok_b.setCursor(Qt.PointingHandCursor)
+            ok_b.setStyleSheet(primary_btn_css)
+            ok_b.setEnabled(self._busy_action != "switch")
+            target_id = target.get("id", "")
+            ok_b.clicked.connect(lambda _checked=False, tid=target_id: self._accept_confirm_switch(tid))
+            c_btns.addWidget(ok_b)
+            c_lay.addLayout(c_btns)
+            self.groups_layout.addWidget(conf)
+
+        # 4. Saved accounts list (with inline per-card confirmation)
+        confirm_card_widget = None
+        if not accounts:
+            empty = QLabel("暂无已保存账号。点击上方「保存当前账号」或导入 agy-switch 数据。")
+            empty.setWordWrap(True)
+            empty.setStyleSheet(
+                f"color: {pal['muted']}; background: {pal['card_alt']}; border-radius: 8px; "
+                f"padding: 10px; font-size: 11.5px;"
+            )
+            self.groups_layout.addWidget(empty)
+        else:
+            locked = bool(acc_data.get("switchLocked")) or self._busy_action == "switch"
+            for acc in accounts:
+                is_confirming = bool(confirm_id and acc.get("id") == confirm_id)
+                card_w = self._build_account_card(acc, locked, is_confirming=is_confirming)
+                self.groups_layout.addWidget(card_w)
+                if is_confirming:
+                    confirm_card_widget = card_w
+
+        self._resize_popover()
+        if confirm_card_widget is not None:
+            QTimer.singleShot(
+                0,
+                lambda w=confirm_card_widget: (
+                    self.scroll.ensureWidgetVisible(w, 0, 8) if w.parent() is not None else None
+                ),
+            )
+
+    def _ask_confirm_switch(self, acc: dict) -> None:
+        self._action_banner = None
+        self._confirm_switch_acc = acc
+        self._schedule_render()
+
+    def _cancel_confirm_switch(self) -> None:
+        self._confirm_switch_acc = None
+        self._schedule_render()
+
+    def _accept_confirm_switch(self, target_id: str) -> None:
+        self._confirm_switch_acc = None
+        if target_id:
+            self.switch_account_requested.emit(target_id)
+        self._schedule_render()
+
+    def _build_account_card(
+        self,
+        acc: dict,
+        switch_locked: bool,
+        is_confirming: bool = False,
+    ) -> QFrame:
+        pal = PALETTES[self._theme]
+        is_cur = bool(acc.get("isCurrent"))
+        has_cred = bool(acc.get("hasCredential"))
+        card = QFrame()
+        card.setObjectName("accountCard")
+        border_col = pal["amber"] if is_confirming else (pal["accent"] if is_cur else pal["border"])
+        card.setStyleSheet(
+            f"#accountCard {{ background: {pal['card_bg']}; border: 1px solid {border_col}; border-radius: 9px; }}"
+        )
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(9, 7, 9, 7)
+        lay.setSpacing(5)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(5)
+
+        title_text = acc.get("remark") or acc.get("email") or ""
+        t_lbl = QLabel(title_text)
+        t_lbl.setStyleSheet(f"color: {pal['fg']}; font-size: 12px; font-weight: 600;")
+        t_lbl.setToolTip(acc.get("email") or "")
+        top.addWidget(t_lbl, 1)
+
+        if acc.get("tier"):
+            top.addWidget(make_pill_label(acc["tier"], pal["card_alt"], pal["muted"], bold=False))
+
+        if is_cur:
+            top.addWidget(make_pill_label("当前", pal["accent_soft"], pal["accent"], bold=True))
+        elif is_confirming:
+            top.addWidget(make_pill_label("待确认", pal["card_alt"], pal["amber"], bold=True))
+        else:
+            sw_btn = QPushButton("切换中..." if self._busy_action == "switch" else "切换")
+            sw_btn.setCursor(Qt.PointingHandCursor)
+            sw_btn.setEnabled(has_cred and not switch_locked)
+            sw_btn.setStyleSheet(
+                f"QPushButton {{ background: {pal['accent']}; color: {pal['accent_fg']}; border: none; "
+                f"border-radius: 4px; padding: 2px 8px; font-size: 11px; font-weight: 600; }}"
+                f"QPushButton:disabled {{ background: {pal['card_alt']}; color: {pal['muted']}; }}"
+            )
+            sw_btn.clicked.connect(lambda _checked=False, a=acc: self._ask_confirm_switch(a))
+            top.addWidget(sw_btn)
+
+        lay.addLayout(top)
+
+        if acc.get("remark") and acc.get("email"):
+            sub = QLabel(acc["email"])
+            sub.setStyleSheet(f"color: {pal['muted']}; font-size: 10.5px;")
+            lay.addWidget(sub)
+
+        if is_confirming:
+            conf_box = QFrame()
+            conf_box.setObjectName("switchConfirmBox")
+            conf_box.setStyleSheet(
+                f"#switchConfirmBox {{ background: {pal['card_alt']}; border: 1px solid {pal['border']}; border-radius: 7px; }}"
+            )
+            c_lay = QVBoxLayout(conf_box)
+            c_lay.setContentsMargins(8, 6, 8, 6)
+            c_lay.setSpacing(5)
+
+            w_lbl = QLabel("将关闭并重启 Antigravity（同步更新 agy CLI），进行中的任务不会迁移。")
+            w_lbl.setWordWrap(True)
+            w_lbl.setStyleSheet(f"color: {pal['amber']}; font-size: 11px;")
+            c_lay.addWidget(w_lbl)
+
+            c_btns = QHBoxLayout()
+            c_btns.setContentsMargins(0, 0, 0, 0)
+            c_btns.setSpacing(6)
+            c_btns.addStretch(1)
+
+            cancel_b = QPushButton("取消")
+            cancel_b.setCursor(Qt.PointingHandCursor)
+            cancel_b.setStyleSheet(
+                f"QPushButton {{ background: {pal['card_bg']}; color: {pal['fg']}; border: 1px solid {pal['border']}; "
+                f"border-radius: 5px; padding: 3px 9px; font-size: 11px; font-weight: 500; }}"
+                f"QPushButton:hover {{ background: {pal['hover']}; }}"
+            )
+            cancel_b.clicked.connect(self._cancel_confirm_switch)
+            c_btns.addWidget(cancel_b)
+
+            ok_b = QPushButton("确认重启切换")
+            ok_b.setCursor(Qt.PointingHandCursor)
+            ok_b.setEnabled(not switch_locked)
+            ok_b.setStyleSheet(
+                f"QPushButton {{ background: {pal['accent']}; color: {pal['accent_fg']}; border: none; "
+                f"border-radius: 5px; padding: 3px 10px; font-size: 11px; font-weight: 600; }}"
+                f"QPushButton:disabled {{ opacity: 0.55; }}"
+            )
+            target_id = acc.get("id", "")
+            ok_b.clicked.connect(lambda _checked=False, tid=target_id: self._accept_confirm_switch(tid))
+            c_btns.addWidget(ok_b)
+
+            c_lay.addLayout(c_btns)
+            lay.addWidget(conf_box)
+
+        last_quota = acc.get("lastQuota") or {}
+        groups = last_quota.get("groups") or []
+        if groups:
+            chips_host = QWidget()
+            chips_host.setStyleSheet("background: transparent;")
+            flow = FlowLayout(chips_host, margin=0, h_spacing=4, v_spacing=3)
+            is_used = self._mode == "used"
+            for grp in groups[:3]:
+                fh = grp.get("fiveHourUsed") if is_used else grp.get("fiveHourRemaining")
+                wk = grp.get("weeklyUsed") if is_used else grp.get("weeklyRemaining")
+                parts = []
+                if isinstance(fh, (int, float)):
+                    parts.append(f"5h {fmt_pct(fh)}")
+                if isinstance(wk, (int, float)):
+                    parts.append(f"周 {fmt_pct(wk)}")
+                if not parts:
+                    continue
+                g_short = short_family_chip_name(grp.get("displayName") or "Group")
+                if "claude" in g_short.lower() or "gpt" in g_short.lower():
+                    g_short = "Claude/GPT"
+                elif "gemini" in (grp.get("displayName") or "").lower() and "argon" not in (grp.get("displayName") or "").lower():
+                    g_short = "Gemini"
+                flow.addWidget(
+                    make_pill_label(
+                        f"{g_short} {' / '.join(parts)}",
+                        pal["card_alt"],
+                        pal["muted"],
+                    )
+                )
+            lay.addWidget(chips_host)
+
+        return card
+
     def _resize_popover(self) -> None:
+        prev_size = self.size()
         host_w = POPOVER_VIS_WIDTH - 24
         self.groups_host.setFixedWidth(host_w)
         self.groups_layout.invalidate()
@@ -1338,6 +2120,18 @@ class ExpandedPopover(QWidget):
         self.scroll.setFixedHeight(min(content_h + 4, max_scroll_h))
         self.surface.adjustSize()
         self.adjustSize()
+        if self.size() != prev_size:
+            self.size_changed.emit()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            if self._confirm_switch_acc is not None:
+                self._cancel_confirm_switch()
+            else:
+                self.closed_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def paintEvent(self, _event):
         paint_soft_shadow(self, self.surface.geometry(), 12.0, True, self._theme)
@@ -1511,9 +2305,11 @@ class QuotaWidgetController(QObject):
         self.app = app
         self.prefs = load_prefs()
         self.payload: dict | None = None
+        self.accounts_data: dict | None = None
         self.error_msg: str | None = None
         self.expanded = False
         self.manual_hidden = False
+        self._popover_raised_by_user = False
         self._is_sidecar = bool(os.environ.get("ANTIGRAVITY_LS_ADDRESS"))
         self._parent_pid = os.getppid() if self._is_sidecar else 0
         self._seen_antigravity = False
@@ -1534,22 +2330,35 @@ class QuotaWidgetController(QObject):
 
         self.popover.closed_requested.connect(self.collapse)
         self.popover.mode_toggled.connect(self.toggle_display_mode)
-        self.popover.refresh_requested.connect(lambda: self.client.request_fetch(force=True))
+        self.popover.refresh_requested.connect(self._refresh_all)
+        self.popover.tab_changed.connect(self._on_popover_tab_changed)
+        self.popover.size_changed.connect(self._on_popover_size_changed)
+        self.popover.capture_account_requested.connect(self._capture_current_account)
+        self.popover.import_agy_switch_requested.connect(self._import_agy_switch)
+        self.popover.switch_account_requested.connect(self._trigger_account_switch)
 
         self.client.quota_fetched.connect(self._on_quota_fetched)
+        self.client.accounts_fetched.connect(self._on_accounts_fetched)
+        self.client.account_action_done.connect(self._on_account_action_done)
+
+        self._menu_refs: list[QObject] = []
+        self._tray_menu = QMenu()
+        self._tray_menu.aboutToShow.connect(self._refresh_tray_menu)
+        self._ctx_menu = QMenu()
 
         self.tray = None
         if enable_tray and QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = QSystemTrayIcon(build_tray_icon(), self)
             self.tray.setToolTip("Antigravity 模型用量浮窗")
             self.tray.activated.connect(self._on_tray_activated)
-            self.tray.setContextMenu(self._build_menu())
+            self._populate_menu(self._tray_menu)
+            self.tray.setContextMenu(self._tray_menu)
             self.tray.show()
 
         self.apply_theme_and_render()
 
         self.poll_timer = QTimer(self)
-        self.poll_timer.timeout.connect(lambda: self.client.request_fetch(force=False))
+        self.poll_timer.timeout.connect(self._poll_all)
         self.poll_timer.start(POLL_OK_MS)
 
         self.tick_timer = QTimer(self)
@@ -1561,6 +2370,14 @@ class QuotaWidgetController(QObject):
 
         self.lifecycle_timer = QTimer(self)
         self.lifecycle_timer.timeout.connect(self._check_app_lifecycle)
+
+    def _poll_all(self) -> None:
+        self.client.request_fetch(force=False)
+        self.client.request_fetch_accounts()
+
+    def _refresh_all(self) -> None:
+        self.client.request_fetch(force=True)
+        self.client.request_fetch_accounts()
 
     def start(self) -> None:
         hwnd = self.tracker.find_antigravity_hwnd()
@@ -1575,23 +2392,47 @@ class QuotaWidgetController(QObject):
         if self.prefs["dock"] == "float":
             self._place_float_initial()
             self.mini_card.show()
+            self.tracker.set_topmost(int(self.mini_card.winId()), True)
         else:
             self.track_timer.start(TRACK_MS)
             self._update_dock_position()
-        self.client.request_fetch(force=False)
+        self._poll_all()
 
     def _effective_theme(self) -> str:
         return resolve_theme(self.prefs["theme"])
+
+    def _is_user_interacting_with_popover(self) -> bool:
+        if not (self.expanded and self.popover.isVisible()):
+            return False
+        if self.popover.has_active_account_interaction():
+            return True
+        if QApplication.mouseButtons() != Qt.NoButton and self.popover.underMouse():
+            return True
+        return False
+
+    def _on_popover_size_changed(self) -> None:
+        if self.expanded and self.mini_card.isVisible():
+            self._position_popover()
 
     def apply_theme_and_render(self) -> None:
         theme = self._effective_theme()
         self.mini_card.apply_theme(theme, self.prefs["dock"])
         self.popover.apply_theme(theme)
         self.mini_card.update_data(self.payload, self.error_msg, self.prefs["mode"], self.expanded)
-        self.popover.update_data(self.payload, self.prefs["mode"])
+        self.popover.update_data(self.payload, self.prefs["mode"], self.accounts_data)
         if self.expanded and self.mini_card.isVisible():
             self._position_popover()
         self._update_tray_tooltip()
+
+    def _render_passive_update(self) -> None:
+        if self._is_user_interacting_with_popover():
+            theme = self._effective_theme()
+            self.mini_card.apply_theme(theme, self.prefs["dock"])
+            self.mini_card.update_data(self.payload, self.error_msg, self.prefs["mode"], self.expanded)
+            self.popover.refresh_timestamps(self.payload, self.accounts_data)
+            self._update_tray_tooltip()
+            return
+        self.apply_theme_and_render()
 
     def _on_quota_fetched(self, payload: dict | None, error_msg: str | None) -> None:
         if payload is not None:
@@ -1607,9 +2448,103 @@ class QuotaWidgetController(QObject):
             self.error_msg = error_msg or "连接失败"
             self.poll_timer.setInterval(POLL_RETRY_MS if self._ever_connected else POLL_INIT_RETRY_MS)
 
-        self.apply_theme_and_render()
+        self._render_passive_update()
         if self.prefs["dock"] == "docked":
             self._update_dock_position()
+
+    def _on_accounts_fetched(self, accounts_data: dict | None, _error_msg: str | None) -> None:
+        if accounts_data is not None:
+            self.accounts_data = accounts_data
+            self._render_passive_update()
+
+    def _on_popover_tab_changed(self, tab: str) -> None:
+        if tab == "accounts":
+            self.client.request_fetch_accounts()
+        if self.expanded and self.mini_card.isVisible():
+            self._position_popover()
+
+    def _capture_current_account(self) -> None:
+        self.popover.set_busy_action("capture")
+        self.popover.set_action_banner("info", "正在保存当前登录凭据快照...")
+        self.client.request_capture_account()
+
+    def _import_agy_switch(self) -> None:
+        self.popover.set_busy_action("import_agy")
+        self.popover.set_action_banner("info", "正在从 agy-switch 本地库导入账号...")
+        self.client.request_import_agy_switch()
+
+    def _trigger_account_switch(self, account_id: str) -> None:
+        if not account_id:
+            return
+        self.popover.set_busy_action("switch")
+        self.popover.set_action_banner("info", "正在启动后台切换，Antigravity 即将重启...")
+        self.client.request_switch_account(account_id)
+
+    def _confirm_and_switch_from_menu(self, acc: dict) -> None:
+        snap = dict(acc or {})
+        QTimer.singleShot(0, lambda a=snap: self._exec_menu_switch_confirm(a))
+
+    def _exec_menu_switch_confirm(self, acc: dict) -> None:
+        target_id = acc.get("id") or ""
+        if not target_id:
+            return
+        email = acc.get("email") or ""
+        label = f"{acc['remark']} ({email})" if acc.get("remark") else email
+        box = QMessageBox()
+        box.setWindowTitle("确认切换账号并重启？")
+        box.setIcon(QMessageBox.Question)
+        box.setText(f"即将切换到：{label}")
+        box.setInformativeText("切换将关闭并重启 Antigravity（同步更新 agy CLI），进行中的任务不会迁移。")
+        confirm_btn = box.addButton("确认重启切换", QMessageBox.AcceptRole)
+        cancel_btn = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(confirm_btn)
+        box.setEscapeButton(cancel_btn)
+        box.setWindowFlags(box.windowFlags() | Qt.WindowStaysOnTopHint)
+        box.show()
+        box.raise_()
+        box.activateWindow()
+        try:
+            ctypes.windll.user32.SetForegroundWindow(int(box.winId()))
+        except Exception:
+            pass
+        box.exec_()
+        if box.clickedButton() == confirm_btn:
+            self._trigger_account_switch(target_id)
+
+    def _on_account_action_done(self, action: str, ok: bool, payload: dict | None, err: str | None) -> None:
+        self.popover.set_busy_action(None)
+        if payload and isinstance(payload.get("accountsState"), dict):
+            self.accounts_data = payload["accountsState"]
+
+        if not ok:
+            msg = err or "操作失败"
+            self.popover.set_action_banner("error", msg)
+            if self.tray:
+                self.tray.showMessage("账号操作失败", msg, QSystemTrayIcon.Warning, 4000)
+            self.apply_theme_and_render()
+            return
+
+        if action == "capture":
+            acc = (payload or {}).get("account") or {}
+            msg = (
+                f"已保存账号快照: {acc.get('email', '')}"
+                if (payload or {}).get("created")
+                else f"已更新账号凭据: {acc.get('email', '')}"
+            )
+            self.popover.set_action_banner("success", msg)
+        elif action == "import_agy":
+            imp = (payload or {}).get("imported", 0)
+            upd = (payload or {}).get("updated", 0)
+            skp = (payload or {}).get("skipped", 0)
+            msg = f"导入完成：新增 {imp}，更新 {upd}" + (f"，跳过 {skp}" if skp else "")
+            self.popover.set_action_banner("success", msg)
+        elif action == "switch":
+            msg = (payload or {}).get("message") or "已启动后台切换，Antigravity 即将重启..."
+            self.popover.set_action_banner("info", msg)
+            if self.tray:
+                self.tray.showMessage("正在切换账号", msg, QSystemTrayIcon.Information, 3000)
+
+        self.apply_theme_and_render()
 
     def _check_app_lifecycle(self) -> None:
         if self._is_sidecar and self._parent_pid > 0 and not self.tracker.is_process_alive(self._parent_pid):
@@ -1637,22 +2572,42 @@ class QuotaWidgetController(QObject):
         save_prefs(self.prefs)
 
     def _on_ui_tick(self) -> None:
-        self.apply_theme_and_render()
+        if self.expanded and self.popover.isVisible() and self.popover._active_tab == "accounts":
+            theme = self._effective_theme()
+            self.mini_card.apply_theme(theme, self.prefs["dock"])
+            if self.popover._theme != theme:
+                self.popover.apply_theme(theme)
+            self.mini_card.update_data(self.payload, self.error_msg, self.prefs["mode"], self.expanded)
+            self.popover.refresh_timestamps(self.payload, self.accounts_data)
+            self._update_tray_tooltip()
+            return
+        self._render_passive_update()
 
     def toggle_expand(self) -> None:
         if self.expanded:
             self.collapse()
         else:
             self.expanded = True
+            self._popover_raised_by_user = True
             self.apply_theme_and_render()
             self._position_popover()
             self.popover.show()
-            self.popover.raise_()
+            if self.prefs["dock"] == "float":
+                self.tracker.set_topmost(int(self.mini_card.winId()), True)
+                self.tracker.set_topmost(int(self.popover.winId()), True)
+                self.popover.raise_()
+            else:
+                self._update_dock_position()
+                self.popover.raise_()
+                self.popover.activateWindow()
 
     def collapse(self) -> None:
         self.expanded = False
+        self._popover_raised_by_user = False
         self.popover.hide()
         self.apply_theme_and_render()
+        if self.prefs["dock"] == "docked":
+            self._update_dock_position()
 
     def toggle_display_mode(self) -> None:
         self.prefs["mode"] = "remaining" if self.prefs["mode"] == "used" else "used"
@@ -1678,11 +2633,16 @@ class QuotaWidgetController(QObject):
             self.apply_theme_and_render()
             self._place_float_initial()
             self.mini_card.show()
+            self.tracker.set_topmost(int(self.mini_card.winId()), True)
             self.mini_card.raise_()
             if self.expanded:
                 self._position_popover()
                 self.popover.show()
+                self.tracker.set_topmost(int(self.popover.winId()), True)
+                self.popover.raise_()
         else:
+            self.tracker.set_topmost(int(self.mini_card.winId()), False)
+            self.tracker.set_topmost(int(self.popover.winId()), False)
             self.apply_theme_and_render()
             self.track_timer.start(TRACK_MS)
             self._update_dock_position()
@@ -1703,10 +2663,13 @@ class QuotaWidgetController(QObject):
                 self._update_dock_position()
             else:
                 self.mini_card.show()
+                self.tracker.set_topmost(int(self.mini_card.winId()), True)
                 self.mini_card.raise_()
                 if self.expanded:
                     self._position_popover()
                     self.popover.show()
+                    self.tracker.set_topmost(int(self.popover.winId()), True)
+                    self.popover.raise_()
 
     def _place_float_initial(self) -> None:
         fp = self.prefs.get("float_pos")
@@ -1770,6 +2733,12 @@ class QuotaWidgetController(QObject):
         vis_w, vis_h = self.mini_card.visible_size()
 
         if not hwnd:
+            self.tracker.set_topmost(int(self.mini_card.winId()), False)
+            self.tracker.set_topmost(int(self.popover.winId()), False)
+            if self._seen_antigravity:
+                self.mini_card.hide()
+                self.popover.hide()
+                return
             screen = QApplication.primaryScreen()
             avail = screen.availableGeometry() if screen else QRect(0, 0, 1280, 720)
             tx = avail.left() + 10 - SHADOW_MARGIN
@@ -1784,7 +2753,7 @@ class QuotaWidgetController(QObject):
                     self.popover.show()
             return
 
-        if self.tracker.is_iconic(hwnd):
+        if self.tracker.is_iconic(hwnd) or self.tracker.is_window_cloaked(hwnd):
             self.mini_card.hide()
             self.popover.hide()
             return
@@ -1805,49 +2774,82 @@ class QuotaWidgetController(QObject):
         target_x = max(avail.left() - SHADOW_MARGIN, min(target_x, avail.right() - vis_w - SHADOW_MARGIN))
         target_y = max(avail.top() - SHADOW_MARGIN, min(target_y, avail.bottom() - vis_h - SHADOW_MARGIN))
 
-        # Check foreground window overlap
+        geo = screen.geometry() if screen else QRect(0, 0, 1920, 1080)
+        card_phys_l = mon_origin[0] + round((target_x + SHADOW_MARGIN - geo.left()) * dpr)
+        card_phys_t = mon_origin[1] + round((target_y + SHADOW_MARGIN - geo.top()) * dpr)
+        card_phys_r = card_phys_l + round(vis_w * dpr)
+        card_phys_b = card_phys_t + round(vis_h * dpr)
+        card_phys_rect = (card_phys_l, card_phys_t, card_phys_r, card_phys_b)
+
         fg_hwnd = self.tracker.get_foreground_hwnd()
         agy_pid = self.tracker.get_pid(hwnd)
         fg_pid = self.tracker.get_pid(fg_hwnd) if fg_hwnd else 0
 
-        should_show = True
-        if fg_hwnd and fg_pid not in (self.tracker.own_pid, agy_pid):
-            fg_rect = self.tracker.get_window_rect(fg_hwnd)
-            if fg_rect:
-                geo = screen.geometry() if screen else QRect(0, 0, 1920, 1080)
-                card_phys_l = mon_origin[0] + round((target_x + SHADOW_MARGIN - geo.left()) * dpr)
-                card_phys_t = mon_origin[1] + round((target_y + SHADOW_MARGIN - geo.top()) * dpr)
-                card_phys_r = card_phys_l + round(vis_w * dpr)
-                card_phys_b = card_phys_t + round(vis_h * dpr)
-                intersects = not (
-                    fg_rect[2] <= card_phys_l
-                    or fg_rect[0] >= card_phys_r
-                    or fg_rect[3] <= card_phys_t
-                    or fg_rect[1] >= card_phys_b
-                )
-                if intersects:
-                    should_show = False
+        if self._popover_raised_by_user and fg_pid and fg_pid not in (self.tracker.own_pid, agy_pid):
+            if not (self.popover.underMouse() or self.popover.has_active_account_interaction()):
+                self._popover_raised_by_user = False
+
+        raise_for_popover = bool(
+            self.expanded
+            and (
+                self._popover_raised_by_user
+                or fg_pid == self.tracker.own_pid
+                or self.popover.has_active_account_interaction()
+            )
+        )
+
+        if self.mini_card.pos() != QPoint(target_x, target_y):
+            self.mini_card.move(target_x, target_y)
+
+        mini_hwnd = int(self.mini_card.winId())
+        pop_hwnd = int(self.popover.winId()) if self.expanded else 0
+
+        should_show = self.tracker.sync_docked_zorder(
+            mini_hwnd=mini_hwnd,
+            pop_hwnd=pop_hwnd,
+            pop_visible=self.expanded,
+            agy_hwnd=hwnd,
+            card_phys_rect=card_phys_rect,
+            raise_for_popover=raise_for_popover,
+        )
 
         if not should_show:
             self.mini_card.hide()
             self.popover.hide()
             return
 
-        if self.mini_card.pos() != QPoint(target_x, target_y):
-            self.mini_card.move(target_x, target_y)
+        newly_shown = False
         if not self.mini_card.isVisible():
             self.mini_card.show()
+            newly_shown = True
         if self.expanded:
             self._position_popover()
             if not self.popover.isVisible():
                 self.popover.show()
+                newly_shown = True
+
+        if newly_shown:
+            self.tracker.sync_docked_zorder(
+                mini_hwnd=mini_hwnd,
+                pop_hwnd=pop_hwnd,
+                pop_visible=self.expanded,
+                agy_hwnd=hwnd,
+                card_phys_rect=card_phys_rect,
+                raise_for_popover=raise_for_popover,
+            )
 
     def _update_tray_tooltip(self) -> None:
         if not self.tray:
             return
         cur = (self.payload or {}).get("current") or {}
+        live_email = (
+            ((self.accounts_data or {}).get("liveAccount") or {}).get("email")
+            or ((self.payload or {}).get("account") or {}).get("email")
+            or ""
+        )
         if not cur:
-            self.tray.setToolTip("Antigravity 模型用量浮窗")
+            tip = f"Antigravity 模型用量浮窗\n{live_email}" if live_email else "Antigravity 模型用量浮窗"
+            self.tray.setToolTip(tip)
             return
         label = cur.get("label") or "当前模型"
         fh = cur.get("fiveHour")
@@ -1857,57 +2859,113 @@ class QuotaWidgetController(QObject):
         prefix = "已用" if is_used else "剩余"
         fh_txt = f"5h {prefix} {fmt_pct(fh.get(key))}" if fh else "5h 仅周限额"
         wk_txt = f"1周 {prefix} {fmt_pct(wk.get(key))}" if wk else ""
-        self.tray.setToolTip(f"{label}\n{fh_txt} | {wk_txt}".strip(" |"))
+        head = f"{live_email} · {label}" if live_email else label
+        self.tray.setToolTip(f"{head}\n{fh_txt} | {wk_txt}".strip(" |"))
 
-    def _build_menu(self) -> QMenu:
-        menu = QMenu()
+    def _populate_menu(self, menu: QMenu) -> QMenu:
+        menu.clear()
+        refs: list[QObject] = []
 
         toggle_vis = QAction("隐藏浮窗" if self.mini_card.isVisible() else "显示浮窗", menu)
         toggle_vis.triggered.connect(self.toggle_visible)
         menu.addAction(toggle_vis)
+        refs.append(toggle_vis)
 
         toggle_exp = QAction("收起全部模型" if self.expanded else "展开全部模型", menu)
         toggle_exp.triggered.connect(self.toggle_expand)
         menu.addAction(toggle_exp)
+        refs.append(toggle_exp)
+
+        acct_menu = menu.addMenu("账号切换")
+        refs.append(acct_menu)
+        acc_data = self.accounts_data or {}
+        live_email = (
+            ((acc_data.get("liveAccount") or {}).get("email"))
+            or (((self.payload or {}).get("account") or {}).get("email"))
+            or ""
+        )
+        hdr_act = QAction(f"当前: {live_email or '未检测到在线账号'}", acct_menu)
+        hdr_act.setEnabled(False)
+        acct_menu.addAction(hdr_act)
+        refs.append(hdr_act)
+
+        save_act = QAction("保存当前账号快照", acct_menu)
+        save_act.triggered.connect(self._capture_current_account)
+        acct_menu.addAction(save_act)
+        refs.append(save_act)
+
+        agy_cnt = int(acc_data.get("agySwitchCount") or 0)
+        imp_act = QAction(f"从 agy-switch 导入 ({agy_cnt})" if agy_cnt > 0 else "从 agy-switch 导入", acct_menu)
+        imp_act.triggered.connect(self._import_agy_switch)
+        acct_menu.addAction(imp_act)
+        refs.append(imp_act)
+
+        accounts = acc_data.get("accounts") or []
+        switch_locked = bool(acc_data.get("switchLocked"))
+        if accounts:
+            acct_menu.addSeparator()
+            for acc in accounts:
+                title = acc.get("remark") or acc.get("email") or "未知账号"
+                if acc.get("tier"):
+                    title = f"{title} [{acc['tier']}]"
+                if acc.get("isCurrent"):
+                    title = f"{title} (当前)"
+                act = QAction(title, acct_menu, checkable=True)
+                act.setChecked(bool(acc.get("isCurrent")))
+                if acc.get("isCurrent") or not acc.get("hasCredential") or switch_locked:
+                    act.setEnabled(False)
+                else:
+                    act.triggered.connect(lambda _checked=False, a=dict(acc): self._confirm_and_switch_from_menu(a))
+                acct_menu.addAction(act)
+                refs.append(act)
 
         menu.addSeparator()
 
         dock_group = QActionGroup(menu)
+        refs.append(dock_group)
         act_docked = QAction("吸附到 Antigravity 左下角", menu, checkable=True)
         act_docked.setChecked(self.prefs["dock"] == "docked")
         act_docked.triggered.connect(lambda: self.set_dock_mode("docked"))
         dock_group.addAction(act_docked)
         menu.addAction(act_docked)
+        refs.append(act_docked)
 
         act_float = QAction("自由悬浮置顶", menu, checkable=True)
         act_float.setChecked(self.prefs["dock"] == "float")
         act_float.triggered.connect(lambda: self.set_dock_mode("float"))
         dock_group.addAction(act_float)
         menu.addAction(act_float)
+        refs.append(act_float)
 
         menu.addSeparator()
 
         mode_group = QActionGroup(menu)
+        refs.append(mode_group)
         act_used = QAction("已用视角", menu, checkable=True)
         act_used.setChecked(self.prefs["mode"] == "used")
         act_used.triggered.connect(lambda: self.set_display_mode("used"))
         mode_group.addAction(act_used)
         menu.addAction(act_used)
+        refs.append(act_used)
 
         act_rem = QAction("剩余视角", menu, checkable=True)
         act_rem.setChecked(self.prefs["mode"] == "remaining")
         act_rem.triggered.connect(lambda: self.set_display_mode("remaining"))
         mode_group.addAction(act_rem)
         menu.addAction(act_rem)
+        refs.append(act_rem)
 
         theme_menu = menu.addMenu("外观主题")
+        refs.append(theme_menu)
         theme_group = QActionGroup(theme_menu)
+        refs.append(theme_group)
         for label, key in [("跟随系统", "system"), ("浅色", "light"), ("深色", "dark")]:
             act = QAction(label, theme_menu, checkable=True)
             act.setChecked(self.prefs["theme"] == key)
             act.triggered.connect(lambda _checked=False, k=key: self.set_theme_pref(k))
             theme_group.addAction(act)
             theme_menu.addAction(act)
+            refs.append(act)
 
         menu.addSeparator()
 
@@ -1915,36 +2973,53 @@ class QuotaWidgetController(QObject):
         act_auto_exit.setChecked(bool(self.prefs.get("auto_exit_with_app", True)))
         act_auto_exit.triggered.connect(self.toggle_auto_exit)
         menu.addAction(act_auto_exit)
+        refs.append(act_auto_exit)
 
         act_refresh = QAction("立即刷新", menu)
-        act_refresh.triggered.connect(lambda: self.client.request_fetch(force=True))
+        act_refresh.triggered.connect(self._refresh_all)
         menu.addAction(act_refresh)
+        refs.append(act_refresh)
 
         act_quit = QAction("退出", menu)
         act_quit.triggered.connect(self.quit_app)
         menu.addAction(act_quit)
+        refs.append(act_quit)
 
+        self._menu_refs = refs
         return menu
 
+    def _refresh_tray_menu(self) -> None:
+        self._populate_menu(self._tray_menu)
+
+    def _build_menu(self) -> QMenu:
+        menu = QMenu()
+        return self._populate_menu(menu)
+
     def _show_context_menu(self, global_pos: QPoint) -> None:
-        menu = self._build_menu()
-        menu.exec_(global_pos)
+        self._populate_menu(self._ctx_menu)
+        self._ctx_menu.exec_(global_pos)
 
     def _on_tray_activated(self, reason) -> None:
         if reason == QSystemTrayIcon.Trigger:
             if self.mini_card.isVisible():
-                self.mini_card.raise_()
-                if self.expanded:
-                    self.popover.raise_()
+                if self.prefs["dock"] == "docked":
+                    if self.expanded:
+                        self._popover_raised_by_user = True
+                    self._update_dock_position()
+                else:
+                    self.tracker.set_topmost(int(self.mini_card.winId()), True)
+                    self.mini_card.raise_()
+                    if self.expanded:
+                        self.tracker.set_topmost(int(self.popover.winId()), True)
+                        self.popover.raise_()
             else:
                 self.manual_hidden = False
                 if self.prefs["dock"] == "docked":
                     self._update_dock_position()
                 else:
                     self.mini_card.show()
+                    self.tracker.set_topmost(int(self.mini_card.winId()), True)
                     self.mini_card.raise_()
-        elif reason == QSystemTrayIcon.Context and self.tray:
-            self.tray.setContextMenu(self._build_menu())
 
     def quit_app(self) -> None:
         self.lifecycle_timer.stop()
@@ -1977,6 +3052,63 @@ def run_self_test() -> int:
         }, ensure_ascii=False))
         return 1
 
+    live_accounts, _acc_err, _ = client.fetch_accounts_sync()
+    if not live_accounts or not live_accounts.get("accounts"):
+        accounts_fixture = {
+            "schemaVersion": 1,
+            "liveAccount": {
+                "email": "test@example.com",
+                "tier": "Google AI Pro",
+                "isSaved": True,
+            },
+            "agySwitchDetected": True,
+            "agySwitchCount": 2,
+            "accounts": [
+                {
+                    "id": "self-test-1",
+                    "email": "test@example.com",
+                    "remark": "主力账号",
+                    "tier": "Google AI Pro",
+                    "isCurrent": True,
+                    "hasCredential": True,
+                    "lastQuota": {
+                        "fetchedAt": payload.get("fetchedAt"),
+                        "groups": [
+                            {
+                                "displayName": "Gemini",
+                                "fiveHourUsed": 12.0,
+                                "fiveHourRemaining": 88.0,
+                                "weeklyUsed": 24.0,
+                                "weeklyRemaining": 76.0,
+                            }
+                        ],
+                    },
+                },
+                {
+                    "id": "self-test-2",
+                    "email": "backup@example.com",
+                    "remark": "备用账号",
+                    "tier": "Free",
+                    "isCurrent": False,
+                    "hasCredential": True,
+                    "lastQuota": {
+                        "fetchedAt": payload.get("fetchedAt"),
+                        "groups": [
+                            {
+                                "displayName": "Claude/GPT",
+                                "fiveHourUsed": 5.0,
+                                "fiveHourRemaining": 95.0,
+                                "weeklyUsed": 10.0,
+                                "weeklyRemaining": 90.0,
+                            }
+                        ],
+                    },
+                },
+            ],
+        }
+    else:
+        accounts_fixture = live_accounts
+
     mini = MiniQuotaCard()
     pop = ExpandedPopover()
 
@@ -1986,37 +3118,137 @@ def run_self_test() -> int:
             dock = "docked" if mode == "used" else "float"
             mini.apply_theme(theme, dock)
             pop.apply_theme(theme)
+            pop.set_active_tab("quota")
             mini.update_data(payload, err, mode, expanded=True)
-            pop.update_data(payload, mode)
+            pop.update_data(payload, mode, accounts_fixture)
             mini.show()
             pop.show()
             app.processEvents()
 
             pm_mini = mini.grab()
-            pm_pop = pop.grab()
+            pm_pop_quota = pop.grab()
             if pm_mini.isNull() or pm_mini.width() <= 0 or pm_mini.height() <= 0:
                 print(json.dumps({"ok": False, "error": "MiniQuotaCard grab failed"}, ensure_ascii=False))
                 return 1
-            if pm_pop.isNull() or pm_pop.width() <= 0 or pm_pop.height() <= 0:
-                print(json.dumps({"ok": False, "error": "ExpandedPopover grab failed"}, ensure_ascii=False))
+            if pm_pop_quota.isNull() or pm_pop_quota.width() <= 0 or pm_pop_quota.height() <= 0:
+                print(json.dumps({"ok": False, "error": "ExpandedPopover quota tab grab failed"}, ensure_ascii=False))
                 return 1
+
+            pop.set_active_tab("accounts")
+            app.processEvents()
+            pm_pop_accounts = pop.grab()
+            if pm_pop_accounts.isNull() or pm_pop_accounts.width() <= 0 or pm_pop_accounts.height() <= 0:
+                print(json.dumps({"ok": False, "error": "ExpandedPopover accounts tab grab failed"}, ensure_ascii=False))
+                return 1
+
             renders.append({
                 "theme": theme,
                 "mode": mode,
                 "dock": dock,
                 "miniSize": [pm_mini.width(), pm_mini.height()],
-                "popoverSize": [pm_pop.width(), pm_pop.height()],
+                "popoverSize": [pm_pop_quota.width(), pm_pop_quota.height()],
+                "popoverAccountsSize": [pm_pop_accounts.width(), pm_pop_accounts.height()],
             })
 
     tray_icon = build_tray_icon()
     pop.hide()
     mini.hide()
 
+    # End-to-end controller switch interaction & tray menu survival verification (mocked HTTP)
+    import gc
+    import weakref
+
+    switch_fixture_accounts = accounts_fixture
+    if not any(
+        not a.get("isCurrent") and a.get("hasCredential")
+        for a in (switch_fixture_accounts.get("accounts") or [])
+    ):
+        switch_fixture_accounts = {
+            "schemaVersion": 1,
+            "liveAccount": {"email": "test@example.com", "tier": "Pro", "isSaved": True},
+            "accounts": [
+                {"id": "st-cur", "email": "test@example.com", "isCurrent": True, "hasCredential": True},
+                {"id": "st-alt", "email": "alt@example.com", "isCurrent": False, "hasCredential": True},
+            ],
+        }
+
+    ctrl = QuotaWidgetController(app, enable_tray=False)
+    ctrl.poll_timer.stop()
+    ctrl.tick_timer.stop()
+    ctrl.track_timer.stop()
+    ctrl.lifecycle_timer.stop()
+    dispatched_switch_ids: list[str] = []
+    ctrl.client.request_switch_account = lambda aid: dispatched_switch_ids.append(aid)
+    ctrl.client.request_fetch_accounts = lambda: None
+    ctrl.payload = payload
+    ctrl.accounts_data = switch_fixture_accounts
+    ctrl.apply_theme_and_render()
+
+    screen = QApplication.primaryScreen()
+    avail = screen.availableGeometry() if screen else QRect(0, 0, 1280, 720)
+    vis_w, vis_h = ctrl.mini_card.visible_size()
+    ctrl.mini_card.move(avail.left() + 10 - SHADOW_MARGIN, avail.bottom() - vis_h - 46 - SHADOW_MARGIN)
+    ctrl.mini_card.show()
+    ctrl.toggle_expand()
+    app.processEvents()
+
+    ctrl.popover._select_tab("accounts")
+    app.processEvents()
+
+    sw_buttons = [b for b in ctrl.popover.groups_host.findChildren(QPushButton) if b.text() == "切换" and b.isEnabled()]
+    if not sw_buttons:
+        print(json.dumps({"ok": False, "error": "No enabled switch button rendered in accounts tab"}, ensure_ascii=False))
+        return 1
+    sw_buttons[0].click()
+    app.processEvents()
+
+    # Simulate an async /api/accounts refresh arriving while confirmation is open (must NOT wipe confirm button!)
+    ctrl._on_accounts_fetched(switch_fixture_accounts, None)
+    ctrl._on_ui_tick()
+    app.processEvents()
+
+    pop_vis_bottom = ctrl.popover.geometry().bottom() - SHADOW_MARGIN
+    popover_in_bounds = pop_vis_bottom <= avail.bottom() + 2
+
+    ok_buttons = [
+        b for b in ctrl.popover.groups_host.findChildren(QPushButton)
+        if b.text() == "确认重启切换" and b.isEnabled()
+    ]
+    if not ok_buttons:
+        print(json.dumps({"ok": False, "error": "Confirm switch button missing or clobbered by passive refresh"}, ensure_ascii=False))
+        return 1
+    ok_buttons[0].click()
+    app.processEvents()
+
+    if not dispatched_switch_ids:
+        print(json.dumps({"ok": False, "error": "Confirm switch click did not dispatch request_switch_account"}, ensure_ascii=False))
+        return 1
+
+    # Verify persistent tray menu survives right-click activation + GC
+    test_tray = QSystemTrayIcon()
+    ctrl._populate_menu(ctrl._tray_menu)
+    test_tray.setContextMenu(ctrl._tray_menu)
+    menu_ref = weakref.ref(test_tray.contextMenu())
+    ctrl._on_tray_activated(QSystemTrayIcon.Context)
+    ctrl._refresh_tray_menu()
+    gc.collect()
+    tray_menu_survived = menu_ref() is not None and len(ctrl._tray_menu.actions()) > 0
+    if not tray_menu_survived:
+        print(json.dumps({"ok": False, "error": "Tray contextMenu destroyed during activation/GC"}, ensure_ascii=False))
+        return 1
+
+    ctrl.popover.hide()
+    ctrl.mini_card.hide()
+
     cur = payload.get("current") or {}
     report = {
         "ok": True,
         "discoveredPorts": ports,
         "connectedPort": used_port,
+        "accountsTabRendered": True,
+        "controllerSwitchVerified": True,
+        "popoverInBoundsAfterConfirm": popover_in_bounds,
+        "trayMenuSurvivedRightClick": tray_menu_survived,
         "currentModel": {
             "modelId": cur.get("modelId"),
             "label": cur.get("label"),
@@ -2037,6 +3269,12 @@ def main() -> int:
         return run_self_test()
 
     mutex_handle = acquire_single_instance_mutex()
+    if mutex_handle is None:
+        for _ in range(8):
+            time.sleep(0.3)
+            mutex_handle = acquire_single_instance_mutex()
+            if mutex_handle is not None:
+                break
     if mutex_handle is None:
         log_event("skipped reason=already_running")
         return 0

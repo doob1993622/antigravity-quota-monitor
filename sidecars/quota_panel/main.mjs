@@ -1,17 +1,19 @@
 /**
- * Antigravity Sidebar Model Quota Monitor Sidecar Backend.
+ * Antigravity Sidebar Model Quota Monitor & Local Account Switcher Sidecar Backend.
  *
- * Read-only local sidecar that queries the Antigravity Language Server's
- * Connect-RPC endpoints (`RetrieveUserQuotaSummary` & `GetUserStatus`) and
- * inspects the active conversation transcript / client state to identify the
- * current model, returning 5-hour and weekly quota usage for both the active
- * model and all model groups.
+ * Queries the Antigravity Language Server's Connect-RPC endpoints
+ * (`RetrieveUserQuotaSummary` & `GetUserStatus`) and inspects the active
+ * conversation transcript / client state to identify the current model, while
+ * managing a pure-local credential snapshot vault for one-click account switching
+ * (syncing Antigravity App, IDE 2.6+, and native `agy` CLI sessions).
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SidecarApp, Response } from 'sidecar_sdk';
+import { createAccountStore, resolveVaultDir } from './accounts_store.mjs';
+import { launchSwitchWorker } from './switch_worker.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ID_RE = /^[0-9a-f-]{8,}$/i;
@@ -684,6 +686,8 @@ function buildQuotaPayload({ fetchedAt, quotaSummary, userStatus, stale, error }
 
   const planName = userStatus?.planStatus?.planInfo?.planName || userStatus?.userTier?.name || null;
   const tierName = userStatus?.userTier?.name || planName || null;
+  const userEmail = typeof userStatus?.email === 'string' ? userStatus.email.trim() : '';
+  const userName = typeof userStatus?.name === 'string' ? userStatus.name.trim() : '';
 
   let currentPayload = null;
   if (currentDetected) {
@@ -714,6 +718,7 @@ function buildQuotaPayload({ fetchedAt, quotaSummary, userStatus, stale, error }
     stale: Boolean(stale),
     error: error || null,
     conversationId: convId || null,
+    account: userEmail || userName ? { email: userEmail || null, name: userName || null } : null,
     tier: tierName || planName ? { id: userStatus?.userTier?.id || null, name: tierName, planName } : null,
     summaryDescription: quotaSummary?.description || '',
     current: currentPayload,
@@ -723,9 +728,35 @@ function buildQuotaPayload({ fetchedAt, quotaSummary, userStatus, stale, error }
 }
 
 // ---------------------------------------------------------------------------
-// Sidecar HTTP Server (strictly read-only GET routes)
+// Runtime paths, account vault & Sidecar HTTP Server
 // ---------------------------------------------------------------------------
+const pluginDirName = basename(resolve(__dirname, '..', '..')) || 'quota-monitor';
+const runtimeDir =
+  process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR ||
+  join(homedir(), '.gemini', 'antigravity', 'sidecar_data', pluginDirName, 'quota_panel', 'data');
+const runtimeFile = join(runtimeDir, 'runtime.json');
+const sidecarTokenFile = join(runtimeDir, 'sidecar_token.json');
+const accountStore = createAccountStore({ vaultDir: resolveVaultDir(runtimeDir) });
+
+function jsonError(status, message) {
+  return new Response(JSON.stringify({ error: message }), {
+    status,
+    contentType: 'application/json; charset=utf-8',
+  });
+}
+
 const app = new SidecarApp();
+
+async function getLiveContext(convIdOverride = '', force = false) {
+  const convId =
+    (typeof convIdOverride === 'string' && convIdOverride.trim()) ||
+    app.config.conversationId ||
+    '';
+  const appData = findAppDataDir();
+  const sources = await fetchQuotaSources(force);
+  const quotaPayload = buildQuotaPayload(sources, appData, convId);
+  return { appData, convId, sources, quotaPayload };
+}
 
 app.page('/', () => readFileSync(join(__dirname, 'index.html'), 'utf-8'));
 
@@ -744,33 +775,213 @@ app.api(
 app.api(
   '/api/quota',
   async (data) => {
-    const convId =
-      (typeof data?.conversationId === 'string' && data.conversationId.trim()) ||
-      app.config.conversationId ||
-      '';
     const force = data?.force === '1' || data?.force === 'true';
-    const appData = findAppDataDir();
-    const sources = await fetchQuotaSources(force);
-    return buildQuotaPayload(sources, appData, convId);
+    const { sources, quotaPayload } = await getLiveContext(data?.conversationId, force);
+    try {
+      accountStore.syncActiveAccountQuota(sources.userStatus, quotaPayload);
+    } catch {
+      // Keep quota endpoint resilient to local vault IO errors.
+    }
+    return quotaPayload;
   },
   'GET',
 );
 
-const pluginDirName = basename(resolve(__dirname, '..', '..')) || 'quota-monitor';
-const runtimeDir =
-  process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR ||
-  join(homedir(), '.gemini', 'antigravity', 'sidecar_data', pluginDirName, 'quota_panel', 'data');
-const runtimeFile = join(runtimeDir, 'runtime.json');
+app.api(
+  '/api/accounts',
+  async (data) => {
+    const { sources, quotaPayload } = await getLiveContext(data?.conversationId, false);
+    try {
+      accountStore.syncActiveAccountQuota(sources.userStatus, quotaPayload);
+    } catch {
+      // Ignore passive sync errors.
+    }
+    return {
+      ...accountStore.listAccounts({
+        liveUserStatus: sources.userStatus,
+        quotaPayload,
+      }),
+      platform: process.platform,
+    };
+  },
+  'GET',
+);
 
-function cleanupRuntimeFile() {
+app.api(
+  '/api/accounts/switch-status',
+  () => ({
+    status: accountStore.readSwitchStatus(),
+    switchLocked: accountStore.isSwitchLocked(),
+  }),
+  'GET',
+);
+
+app.api(
+  '/api/accounts/capture',
+  async (data) => {
+    const { sources, quotaPayload } = await getLiveContext(data?.conversationId, false);
+    try {
+      const result = accountStore.captureCurrentAccount({
+        liveUserStatus: sources.userStatus,
+        quotaPayload,
+        remark: data?.remark,
+      });
+      return {
+        ok: true,
+        ...result,
+        accountsState: accountStore.listAccounts({
+          liveUserStatus: sources.userStatus,
+          quotaPayload,
+        }),
+      };
+    } catch (err) {
+      return jsonError(400, err?.message || String(err));
+    }
+  },
+  'POST',
+);
+
+app.api(
+  '/api/accounts/remark',
+  async (data) => {
+    try {
+      const account = accountStore.updateRemark(data?.id, data?.remark);
+      const { sources, quotaPayload } = await getLiveContext(data?.conversationId, false);
+      return {
+        ok: true,
+        account,
+        accountsState: accountStore.listAccounts({
+          liveUserStatus: sources.userStatus,
+          quotaPayload,
+        }),
+      };
+    } catch (err) {
+      return jsonError(400, err?.message || String(err));
+    }
+  },
+  'POST',
+);
+
+app.api(
+  '/api/accounts/delete',
+  async (data) => {
+    try {
+      const result = accountStore.deleteAccount(data?.id);
+      const { sources, quotaPayload } = await getLiveContext(data?.conversationId, false);
+      return {
+        ok: true,
+        ...result,
+        accountsState: accountStore.listAccounts({
+          liveUserStatus: sources.userStatus,
+          quotaPayload,
+        }),
+      };
+    } catch (err) {
+      return jsonError(400, err?.message || String(err));
+    }
+  },
+  'POST',
+);
+
+app.api(
+  '/api/accounts/import-agy-switch',
+  async (data) => {
+    try {
+      const result = accountStore.importFromAgySwitch();
+      const { sources, quotaPayload } = await getLiveContext(data?.conversationId, false);
+      return {
+        ok: true,
+        ...result,
+        accountsState: accountStore.listAccounts({
+          liveUserStatus: sources.userStatus,
+          quotaPayload,
+        }),
+      };
+    } catch (err) {
+      return jsonError(400, err?.message || String(err));
+    }
+  },
+  'POST',
+);
+
+app.api(
+  '/api/accounts/import-json',
+  async (data) => {
+    try {
+      const result = accountStore.importFromJson(data?.content);
+      const { sources, quotaPayload } = await getLiveContext(data?.conversationId, false);
+      return {
+        ok: true,
+        ...result,
+        accountsState: accountStore.listAccounts({
+          liveUserStatus: sources.userStatus,
+          quotaPayload,
+        }),
+      };
+    } catch (err) {
+      return jsonError(400, err?.message || String(err));
+    }
+  },
+  'POST',
+);
+
+app.api(
+  '/api/accounts/export',
+  (data) => {
+    try {
+      const result = accountStore.exportAccountsJson({ ids: data?.ids });
+      return { ok: true, ...result };
+    } catch (err) {
+      return jsonError(400, err?.message || String(err));
+    }
+  },
+  'POST',
+);
+
+app.api(
+  '/api/accounts/switch',
+  (data) => {
+    try {
+      const { meta } = accountStore.getAccountCredential(data?.id);
+      if (accountStore.isSwitchLocked()) {
+        return jsonError(409, '已有账号切换任务正在执行中，请等待 Antigravity 完成重启。');
+      }
+      const worker = launchSwitchWorker({
+        accountId: meta.id,
+        vaultDir: accountStore.vaultDir,
+        appDataDir: findAppDataDir(),
+        homeDir: homedir(),
+        targetEmail: meta.email,
+      });
+      return {
+        ok: true,
+        switching: true,
+        targetId: meta.id,
+        targetEmail: meta.email,
+        workerPid: worker.pid,
+        message: `正在切换到 ${meta.email}，Antigravity 即将重启...`,
+      };
+    } catch (err) {
+      return jsonError(400, err?.message || String(err));
+    }
+  },
+  'POST',
+);
+
+function removeOwnedFile(filePath) {
   try {
-    const existing = JSON.parse(readFileSync(runtimeFile, 'utf-8'));
+    const existing = JSON.parse(readFileSync(filePath, 'utf-8'));
     if (existing && existing.pid === process.pid) {
-      unlinkSync(runtimeFile);
+      unlinkSync(filePath);
     }
   } catch {
-    // Ignore missing or already-removed runtime file.
+    // Ignore missing or already-removed file.
   }
+}
+
+function cleanupRuntimeFile() {
+  removeOwnedFile(runtimeFile);
+  removeOwnedFile(sidecarTokenFile);
 }
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
@@ -799,8 +1010,21 @@ app.run().then((server) => {
         ),
         'utf-8',
       );
+      writeFileSync(
+        sidecarTokenFile,
+        JSON.stringify(
+          {
+            token: process.env.ANTIGRAVITY_SIDECAR_UI_TOKEN || '',
+            pid: process.pid,
+            startedAt: Date.now(),
+          },
+          null,
+          2,
+        ),
+        { encoding: 'utf-8', mode: 0o600 },
+      );
     }
   } catch (err) {
-    console.error(`[quota_panel] failed to write runtime.json: ${err?.message || err}`);
+    console.error(`[quota_panel] failed to write runtime metadata: ${err?.message || err}`);
   }
 });

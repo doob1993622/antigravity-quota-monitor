@@ -5,6 +5,7 @@
 
   const SOURCE_LABELS = {
     conversation: '当前对话',
+    recent_conversation: '最近对话',
     last_selected: '最近选用',
     default: '默认模型',
     fallback: '默认回退',
@@ -32,7 +33,16 @@
 
   const state = {
     data: null,
-    expanded: false, // Always collapsed on initial open.
+    accountsData: null,
+    expanded: false,
+    accountsExpanded: false,
+    importOpen: false,
+    editingRemarkId: null,
+    confirmDeleteId: null,
+    pendingSwitchAccount: null,
+    accountToast: null, // { text, kind: 'info'|'success'|'error' }
+    busyAction: null,
+    switchingBanner: null, // { text, kind: 'info'|'success'|'error' }
     mode: loadMode(),
     loading: true,
     refreshing: false,
@@ -50,6 +60,25 @@
       throw new Error(`HTTP ${res.status}`);
     }
     return res.json();
+  }
+
+  async function postJson(path, body = {}) {
+    const fn = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
+    const res = await fn(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    let payload = null;
+    try {
+      payload = await res.json();
+    } catch {
+      payload = null;
+    }
+    if (!res.ok) {
+      throw new Error(payload?.error || `HTTP ${res.status}`);
+    }
+    return payload || {};
   }
 
   // ---------- Host theme synchronization ----------
@@ -132,7 +161,188 @@
     return 'tone-ok';
   }
 
-  // ---------- Rendering ----------
+  function shortGroupName(name) {
+    const s = String(name || '').trim();
+    if (/claude|gpt/i.test(s)) return 'Claude/GPT';
+    if (/argon/i.test(s)) return 'Argon';
+    if (/carbon/i.test(s)) return 'Carbon';
+    if (/gemini/i.test(s)) return 'Gemini';
+    return s.slice(0, 14) || 'Group';
+  }
+
+  // ---------- Account bar & drawer rendering ----------
+  function renderCachedQuotaChips(lastQuota) {
+    const groups = lastQuota?.groups;
+    if (!Array.isArray(groups) || !groups.length) return '';
+    const isUsed = state.mode === 'used';
+    const chips = groups
+      .slice(0, 3)
+      .map((g) => {
+        const fhVal = isUsed ? g.fiveHourUsed : g.fiveHourRemaining;
+        const wkVal = isUsed ? g.weeklyUsed : g.weeklyRemaining;
+        const parts = [];
+        if (typeof fhVal === 'number') parts.push(`5h ${fmtPct(fhVal)}`);
+        if (typeof wkVal === 'number') parts.push(`周 ${fmtPct(wkVal)}`);
+        if (!parts.length) return '';
+        return `<span class="quota-mini-chip">${esc(shortGroupName(g.displayName))} · ${esc(parts.join(' / '))}</span>`;
+      })
+      .filter(Boolean);
+    if (!chips.length) return '';
+    return `<div class="account-quota-chips">${chips.join('')}</div>`;
+  }
+
+  function renderAccountSection() {
+    const accState = state.accountsData;
+    const accounts = accState?.accounts || [];
+    const live = accState?.liveAccount || state.data?.account || null;
+    const currentSaved = accounts.find((a) => a.isCurrent);
+
+    const dot = $('account-live-dot');
+    const labelEl = $('active-account-label');
+    const statusPill = $('active-account-status');
+    const saveBtn = $('save-current-btn');
+
+    if (currentSaved) {
+      dot.className = 'account-dot';
+      labelEl.textContent = currentSaved.remark
+        ? `${currentSaved.remark} (${currentSaved.email})`
+        : currentSaved.email;
+      labelEl.title = currentSaved.email;
+      statusPill.textContent = currentSaved.tier || '已保存';
+      statusPill.className = 'pill pill-accent';
+      saveBtn.textContent = '更新凭据';
+    } else if (live?.email) {
+      dot.className = 'account-dot is-unsaved';
+      labelEl.textContent = live.email;
+      labelEl.title = live.email;
+      statusPill.textContent = '未保存';
+      statusPill.className = 'pill pill-muted';
+      saveBtn.textContent = '保存当前';
+    } else {
+      dot.className = 'account-dot is-offline';
+      labelEl.textContent = accounts.length ? '未检测到在线账号' : '未保存账号快照';
+      labelEl.title = '';
+      statusPill.classList.add('hidden');
+      saveBtn.textContent = '保存当前';
+    }
+
+    saveBtn.disabled = Boolean(state.busyAction);
+    $('accounts-count-badge').textContent = String(accounts.length);
+    const toggleBtn = $('accounts-toggle-btn');
+    toggleBtn.setAttribute('aria-expanded', String(state.accountsExpanded));
+    $('account-drawer').classList.toggle('hidden', !state.accountsExpanded);
+
+    // Switch banner from active click OR persisted switch_status.json
+    const bannerEl = $('switch-status-banner');
+    let banner = state.switchingBanner;
+    if (!banner && accState?.switchStatus?.state === 'failed' && accState.switchStatus.error) {
+      banner = { text: `上次切换未完成：${accState.switchStatus.error}`, kind: 'error' };
+    }
+    if (banner) {
+      bannerEl.className = `switch-status-banner ${banner.kind === 'error' ? 'is-error' : banner.kind === 'success' ? 'is-success' : ''}`;
+      bannerEl.innerHTML = `<span>${esc(banner.text)}</span><button type="button" class="icon-mini-btn" data-action="dismiss-banner">关闭</button>`;
+      bannerEl.classList.remove('hidden');
+    } else {
+      bannerEl.classList.add('hidden');
+    }
+
+    // Drawer toolbar badges & panels
+    const agyCountEl = $('agy-switch-count');
+    if (accState?.agySwitchDetected && accState.agySwitchCount > 0) {
+      agyCountEl.textContent = String(accState.agySwitchCount);
+      agyCountEl.classList.remove('hidden');
+    } else {
+      agyCountEl.classList.add('hidden');
+    }
+
+    $('import-panel').classList.toggle('hidden', !state.importOpen);
+
+    const toastEl = $('account-toast');
+    if (state.accountToast) {
+      toastEl.textContent = state.accountToast.text;
+      toastEl.className = `account-toast ${state.accountToast.kind === 'error' ? 'is-error' : state.accountToast.kind === 'success' ? 'is-success' : ''}`;
+      toastEl.classList.remove('hidden');
+    } else {
+      toastEl.classList.add('hidden');
+    }
+
+    const listEl = $('accounts-list');
+    if (!accounts.length) {
+      listEl.innerHTML = '<div class="accounts-empty">暂无已保存账号。点击「保存当前凭据」或从 agy-switch / JSON 导入。</div>';
+    } else {
+      const switchLocked = Boolean(accState?.switchLocked || state.busyAction === 'switch');
+      listEl.innerHTML = accounts.map((acc) => {
+        const displayTitle = acc.remark ? acc.remark : acc.email;
+        const subParts = [];
+        if (acc.remark) subParts.push(acc.email);
+        else if (acc.name) subParts.push(acc.name);
+        if (acc.lastQuota?.fetchedAt) {
+          subParts.push(`缓存于 ${fmtRelativeUpdated(acc.lastQuota.fetchedAt)}`);
+        }
+
+        const isEditing = state.editingRemarkId === acc.id;
+        const isDeleting = state.confirmDeleteId === acc.id;
+
+        const actionBtns = isDeleting
+          ? `
+            <button type="button" class="tool-btn tool-btn-danger" data-action="confirm-delete" data-id="${esc(acc.id)}">确认删除</button>
+            <button type="button" class="icon-mini-btn" data-action="cancel-delete">取消</button>
+          `
+          : `
+            <button type="button" class="icon-mini-btn" data-action="edit-remark" data-id="${esc(acc.id)}" title="编辑备注">备注</button>
+            ${
+              acc.isCurrent
+                ? '<span class="pill pill-accent">当前</span>'
+                : `<button type="button" class="tool-btn tool-btn-primary" data-action="request-switch" data-id="${esc(acc.id)}" ${(!acc.hasCredential || switchLocked) ? 'disabled' : ''}>切换</button>`
+            }
+            <button type="button" class="icon-mini-btn" data-action="ask-delete" data-id="${esc(acc.id)}" title="从本地库移除">删除</button>
+          `;
+
+        const remarkEditor = isEditing
+          ? `
+            <div class="remark-edit-row">
+              <input type="text" class="remark-input" id="remark-input-${esc(acc.id)}" maxlength="40" value="${esc(acc.remark || '')}" placeholder="输入简短备注（最多40字）">
+              <button type="button" class="tool-btn tool-btn-primary" data-action="save-remark" data-id="${esc(acc.id)}">保存</button>
+              <button type="button" class="icon-mini-btn" data-action="cancel-remark">取消</button>
+            </div>
+          `
+          : '';
+
+        return `
+          <div class="account-row ${acc.isCurrent ? 'is-current' : ''}">
+            <div class="account-row-top">
+              <div class="account-row-main">
+                <div class="account-row-title">
+                  <span class="account-row-name">${esc(displayTitle)}</span>
+                  ${acc.tier ? `<span class="pill pill-muted">${esc(acc.tier)}</span>` : ''}
+                  ${!acc.hasCredential ? '<span class="pill pill-muted">缺凭据</span>' : ''}
+                </div>
+                ${subParts.length ? `<div class="account-row-sub">${esc(subParts.join(' · '))}</div>` : ''}
+              </div>
+              <div class="account-row-actions">${actionBtns}</div>
+            </div>
+            ${remarkEditor}
+            ${renderCachedQuotaChips(acc.lastQuota)}
+          </div>
+        `;
+      }).join('');
+    }
+
+    // Confirmation modal
+    const modal = $('switch-confirm-modal');
+    if (state.pendingSwitchAccount) {
+      const target = state.pendingSwitchAccount;
+      const fromText = currentSaved?.email || live?.email || '当前登录账号';
+      const toText = target.remark ? `${target.remark} (${target.email})` : target.email;
+      $('switch-modal-desc').textContent = `即将从「${fromText}」切换到「${toText}」。`;
+      $('switch-confirm-btn').disabled = state.busyAction === 'switch';
+      modal.classList.remove('hidden');
+    } else {
+      modal.classList.add('hidden');
+    }
+  }
+
+  // ---------- Quota rendering ----------
   function renderMeterHtml(label, bucket, missingText) {
     if (!bucket) {
       return `
@@ -207,6 +417,8 @@
     modeRem.setAttribute('aria-pressed', String(state.mode === 'remaining'));
 
     $('refresh-btn').classList.toggle('spinning', state.refreshing);
+
+    renderAccountSection();
 
     $('loading').classList.toggle('hidden', !state.loading || Boolean(state.data));
 
@@ -306,7 +518,12 @@
     });
   }
 
-  // ---------- Data fetching ----------
+  function showToast(text, kind = 'info') {
+    state.accountToast = { text, kind };
+    render();
+  }
+
+  // ---------- Data fetching & account actions ----------
   async function loadQuota({ force = false } = {}) {
     if (state.refreshing) return;
     state.refreshing = true;
@@ -317,14 +534,140 @@
       if (convId) qs.set('conversationId', convId);
       if (force) qs.set('force', '1');
       const query = qs.toString();
-      const payload = await fetchJson(`/api/quota${query ? `?${query}` : ''}`);
-      state.data = payload;
-      state.error = payload.error || null;
+
+      const [quotaResult, accountsResult] = await Promise.allSettled([
+        fetchJson(`/api/quota${query ? `?${query}` : ''}`),
+        fetchJson(`/api/accounts${convId ? `?conversationId=${encodeURIComponent(convId)}` : ''}`),
+      ]);
+
+      if (quotaResult.status === 'fulfilled') {
+        state.data = quotaResult.value;
+        state.error = quotaResult.value?.error || null;
+      } else {
+        state.error = quotaResult.reason?.message || String(quotaResult.reason);
+      }
+
+      if (accountsResult.status === 'fulfilled') {
+        state.accountsData = accountsResult.value;
+      }
     } catch (err) {
       state.error = err?.message || String(err);
     } finally {
       state.loading = false;
       state.refreshing = false;
+      render();
+    }
+  }
+
+  async function captureCurrent() {
+    if (state.busyAction) return;
+    state.busyAction = 'capture';
+    render();
+    try {
+      const res = await postJson('/api/accounts/capture', { conversationId: getConversationId() });
+      if (res.accountsState) state.accountsData = res.accountsState;
+      const email = res.account?.email || '';
+      showToast(res.created ? `已保存账号快照：${email}` : `已更新账号凭据：${email}`, 'success');
+    } catch (err) {
+      state.accountsExpanded = true;
+      showToast(err?.message || String(err), 'error');
+    } finally {
+      state.busyAction = null;
+      render();
+    }
+  }
+
+  async function importAgySwitch() {
+    if (state.busyAction) return;
+    state.busyAction = 'import-agy';
+    render();
+    try {
+      const res = await postJson('/api/accounts/import-agy-switch', { conversationId: getConversationId() });
+      if (res.accountsState) state.accountsData = res.accountsState;
+      const summary = `导入完成：新增 ${res.imported || 0}，更新 ${res.updated || 0}` +
+        (res.skipped ? `，跳过 ${res.skipped}` : '');
+      showToast(summary, res.errors?.length && !res.imported && !res.updated ? 'error' : 'success');
+    } catch (err) {
+      showToast(err?.message || String(err), 'error');
+    } finally {
+      state.busyAction = null;
+      render();
+    }
+  }
+
+  async function submitImportJson() {
+    if (state.busyAction) return;
+    const content = $('import-json-input').value;
+    state.busyAction = 'import-json';
+    render();
+    try {
+      const res = await postJson('/api/accounts/import-json', {
+        content,
+        conversationId: getConversationId(),
+      });
+      if (res.accountsState) state.accountsData = res.accountsState;
+      const summary = `JSON 导入：新增 ${res.imported || 0}，更新 ${res.updated || 0}` +
+        (res.failed ? `，失败 ${res.failed}` : '');
+      if (!res.failed) {
+        $('import-json-input').value = '';
+        state.importOpen = false;
+      }
+      showToast(
+        res.errors?.length ? `${summary}（${res.errors[0]}）` : summary,
+        res.failed && !res.imported && !res.updated ? 'error' : 'success',
+      );
+    } catch (err) {
+      showToast(err?.message || String(err), 'error');
+    } finally {
+      state.busyAction = null;
+      render();
+    }
+  }
+
+  async function exportAccounts() {
+    if (state.busyAction) return;
+    state.busyAction = 'export';
+    render();
+    try {
+      const res = await postJson('/api/accounts/export', {});
+      const blob = new Blob([res.content], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = res.filename || 'antigravity-accounts.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      showToast(`已导出 ${res.count || 0} 个账号备份（含登录凭据，请勿外泄）`, 'success');
+    } catch (err) {
+      showToast(err?.message || String(err), 'error');
+    } finally {
+      state.busyAction = null;
+      render();
+    }
+  }
+
+  async function confirmSwitchAccount() {
+    const target = state.pendingSwitchAccount;
+    if (!target || state.busyAction) return;
+    state.busyAction = 'switch';
+    render();
+    try {
+      const res = await postJson('/api/accounts/switch', { id: target.id });
+      state.pendingSwitchAccount = null;
+      state.switchingBanner = {
+        text: res.message || `正在切换到 ${target.email}，Antigravity 即将重启...`,
+        kind: 'info',
+      };
+    } catch (err) {
+      state.pendingSwitchAccount = null;
+      state.switchingBanner = {
+        text: `切换失败：${err?.message || String(err)}`,
+        kind: 'error',
+      };
+    } finally {
+      state.busyAction = null;
       render();
     }
   }
@@ -351,6 +694,145 @@
 
   $('refresh-btn').addEventListener('click', () => loadQuota({ force: true }));
   $('retry-btn').addEventListener('click', () => loadQuota({ force: true }));
+
+  $('save-current-btn').addEventListener('click', captureCurrent);
+  $('drawer-capture-btn').addEventListener('click', captureCurrent);
+
+  $('accounts-toggle-btn').addEventListener('click', () => {
+    state.accountsExpanded = !state.accountsExpanded;
+    state.confirmDeleteId = null;
+    state.editingRemarkId = null;
+    render();
+  });
+
+  $('import-agy-btn').addEventListener('click', importAgySwitch);
+  $('export-accounts-btn').addEventListener('click', exportAccounts);
+
+  $('toggle-import-json-btn').addEventListener('click', () => {
+    state.importOpen = !state.importOpen;
+    render();
+  });
+
+  $('import-cancel-btn').addEventListener('click', () => {
+    state.importOpen = false;
+    render();
+  });
+
+  $('import-submit-btn').addEventListener('click', submitImportJson);
+
+  $('import-file-input').addEventListener('change', (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      $('import-json-input').value = String(reader.result || '');
+    };
+    reader.readAsText(file, 'utf-8');
+    e.target.value = '';
+  });
+
+  $('switch-status-banner').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-action="dismiss-banner"]');
+    if (!btn) return;
+    state.switchingBanner = null;
+    if (state.accountsData?.switchStatus?.state === 'failed') {
+      state.accountsData.switchStatus = null;
+    }
+    render();
+  });
+
+  $('accounts-list').addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const action = btn.getAttribute('data-action');
+    const id = btn.getAttribute('data-id');
+    const accounts = state.accountsData?.accounts || [];
+
+    if (action === 'edit-remark') {
+      state.editingRemarkId = id;
+      state.confirmDeleteId = null;
+      render();
+      const input = $(`remark-input-${id}`);
+      if (input) input.focus();
+    } else if (action === 'cancel-remark') {
+      state.editingRemarkId = null;
+      render();
+    } else if (action === 'save-remark') {
+      const input = $(`remark-input-${id}`);
+      const remark = input ? input.value : '';
+      try {
+        const res = await postJson('/api/accounts/remark', {
+          id,
+          remark,
+          conversationId: getConversationId(),
+        });
+        if (res.accountsState) state.accountsData = res.accountsState;
+        state.editingRemarkId = null;
+        showToast('备注已更新', 'success');
+      } catch (err) {
+        showToast(err?.message || String(err), 'error');
+      }
+    } else if (action === 'ask-delete') {
+      state.confirmDeleteId = id;
+      state.editingRemarkId = null;
+      render();
+    } else if (action === 'cancel-delete') {
+      state.confirmDeleteId = null;
+      render();
+    } else if (action === 'confirm-delete') {
+      try {
+        const res = await postJson('/api/accounts/delete', {
+          id,
+          conversationId: getConversationId(),
+        });
+        if (res.accountsState) state.accountsData = res.accountsState;
+        state.confirmDeleteId = null;
+        showToast('已从本地账号库移除', 'success');
+      } catch (err) {
+        showToast(err?.message || String(err), 'error');
+      }
+    } else if (action === 'request-switch') {
+      const target = accounts.find((a) => a.id === id);
+      if (target) {
+        state.pendingSwitchAccount = target;
+        render();
+      }
+    }
+  });
+
+  $('accounts-list').addEventListener('keydown', (e) => {
+    const input = e.target.closest('.remark-input');
+    if (!input) return;
+    if (e.key === 'Enter') {
+      const id = input.id.replace(/^remark-input-/, '');
+      const saveBtn = $('accounts-list').querySelector(`[data-action="save-remark"][data-id="${CSS.escape(id)}"]`);
+      if (saveBtn) saveBtn.click();
+    } else if (e.key === 'Escape') {
+      state.editingRemarkId = null;
+      render();
+    }
+  });
+
+  $('switch-cancel-btn').addEventListener('click', () => {
+    state.pendingSwitchAccount = null;
+    render();
+  });
+
+  $('switch-confirm-btn').addEventListener('click', confirmSwitchAccount);
+
+  $('switch-confirm-modal').addEventListener('click', (e) => {
+    if (e.target === $('switch-confirm-modal')) {
+      state.pendingSwitchAccount = null;
+      render();
+    }
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && state.pendingSwitchAccount) {
+      state.pendingSwitchAccount = null;
+      render();
+    }
+  });
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {

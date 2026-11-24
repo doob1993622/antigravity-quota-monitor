@@ -26,8 +26,8 @@
             type="button"
             id="refresh-btn"
             class="icon-btn"
-            title="立即刷新用量"
-            aria-label="立即刷新用量"
+            title="立即刷新用量与账号状态"
+            aria-label="立即刷新用量与账号状态"
           >
             <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
               <path d="M13.5 8a5.5 5.5 0 1 1-1.35-3.61" />
@@ -40,6 +40,77 @@
     </header>
 
     <main class="content">
+      <section id="account-bar" class="account-bar" aria-label="账号管理与切换">
+        <div class="account-bar-head">
+          <div class="account-identity">
+            <span id="account-live-dot" class="account-dot" aria-hidden="true"></span>
+            <span id="active-account-label" class="account-email">检测当前账号中…</span>
+            <span id="active-account-status" class="pill pill-muted hidden"></span>
+          </div>
+          <div class="account-bar-actions">
+            <button
+              type="button"
+              id="save-current-btn"
+              class="mini-btn"
+              title="保存当前系统登录凭据快照到本地账号库"
+            >保存当前</button>
+            <button
+              type="button"
+              id="accounts-toggle-btn"
+              class="mini-btn mini-btn-outline"
+              aria-expanded="false"
+              aria-controls="account-drawer"
+            >
+              <span>账号</span>
+              <span id="accounts-count-badge" class="count-chip">0</span>
+              <svg class="chevron" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M4 6l4 4 4-4" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <div id="switch-status-banner" class="switch-status-banner hidden" role="status"></div>
+
+        <div id="account-drawer" class="account-drawer hidden">
+          <div class="account-toolbar">
+            <button type="button" id="drawer-capture-btn" class="tool-btn">保存当前凭据</button>
+            <button type="button" id="import-agy-btn" class="tool-btn">
+              <span>导入 agy-switch</span>
+              <span id="agy-switch-count" class="count-chip hidden"></span>
+            </button>
+            <button type="button" id="toggle-import-json-btn" class="tool-btn">导入 JSON</button>
+            <button type="button" id="export-accounts-btn" class="tool-btn">导出备份</button>
+          </div>
+
+          <div id="import-panel" class="import-panel hidden">
+            <div class="import-head">粘贴 JSON（支持本插件备份或 agy-switch 导出），或选择本地 .json 文件：</div>
+            <textarea
+              id="import-json-input"
+              class="import-textarea"
+              rows="4"
+              placeholder='{"accounts":[{"email":"user@example.com","refresh_token":"1//..."}]}'
+            ></textarea>
+            <div class="import-actions">
+              <label class="tool-btn file-label">
+                选择文件
+                <input type="file" id="import-file-input" accept=".json,.txt" class="sr-only">
+              </label>
+              <div class="import-actions-right">
+                <button type="button" id="import-cancel-btn" class="tool-btn">取消</button>
+                <button type="button" id="import-submit-btn" class="tool-btn tool-btn-primary">开始导入</button>
+              </div>
+            </div>
+          </div>
+
+          <div id="account-toast" class="account-toast hidden" role="status"></div>
+          <div id="accounts-list" class="accounts-list"></div>
+          <div class="account-drawer-foot">
+            纯本地凭据快照：切换时写入系统凭据与 <code>agy</code> CLI 并重启 Antigravity，仓库与接口均不内置或外传密钥。
+          </div>
+        </div>
+      </section>
+
       <div id="loading" class="loading" aria-busy="true" aria-live="polite">
         <div class="skel-card">
           <div class="skel skel-title"></div>
@@ -89,6 +160,26 @@
         </section>
       </section>
     </main>
+  </div>
+
+  <div
+    id="switch-confirm-modal"
+    class="modal-backdrop hidden"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="switch-modal-title"
+  >
+    <div class="modal-card">
+      <h2 id="switch-modal-title" class="modal-title">确认切换账号并重启？</h2>
+      <p id="switch-modal-desc" class="modal-desc"></p>
+      <div class="modal-warn">
+        切换将关闭并重新启动 Antigravity（同步更新原生 <code>agy</code> CLI 登录态）；正在进行中的任务不会迁移。
+      </div>
+      <div class="modal-actions">
+        <button type="button" id="switch-cancel-btn" class="tool-btn">取消</button>
+        <button type="button" id="switch-confirm-btn" class="tool-btn tool-btn-primary">确认切换并重启</button>
+      </div>
+    </div>
   </div>
 </body>
 </html>

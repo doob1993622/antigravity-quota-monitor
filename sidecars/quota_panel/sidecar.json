@@ -3,7 +3,7 @@
   "args": ["main.mjs"],
   "restart_policy": "on-failure",
   "display_name": "模型用量",
-  "description": "在边栏显示当前模型的 5 小时用量和一周用量，点击可展开查看所有模型的完整用量。",
+  "description": "在边栏显示当前及全部模型的 5 小时与一周用量，并提供纯本地账号凭据快照与一键切换（同步 agy CLI）。",
   "has_web_ui": true,
   "agent_permissions": {
     "allows_user_interactions": false

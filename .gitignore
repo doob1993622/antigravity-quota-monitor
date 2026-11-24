@@ -5,4 +5,9 @@ __pycache__/
 Thumbs.db
 *.log
 runtime.json
+sidecar_token.json
 widget_prefs.json
+switch_status.json
+vault/
+credentials/
+*accounts*.json
