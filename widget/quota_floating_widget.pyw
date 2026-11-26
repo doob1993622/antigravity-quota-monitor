@@ -31,6 +31,7 @@ except ImportError:
 from PyQt5.QtCore import (
     QObject,
     QPoint,
+    QPointF,
     QRect,
     QRectF,
     QSize,
@@ -40,9 +41,11 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtGui import (
     QColor,
+    QCursor,
     QFont,
     QFontMetrics,
     QIcon,
+    QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
@@ -85,8 +88,9 @@ LOG_PORT_RE = re.compile(r"\[sidecar\]\s+listening\s+on\s+127\.0\.0\.1:(\d+)")
 TIER_SUFFIX_RE = re.compile(r"\s*\((Low|Medium|High|XHigh|Extra High|Minimal)\)\s*$", re.I)
 
 SHADOW_MARGIN = 10
-MINI_VIS_WIDTH = 220
-POPOVER_VIS_WIDTH = 332
+MINI_VIS_WIDTH = 140
+MINI_VIS_HEIGHT = 42
+POPOVER_VIS_WIDTH = 256
 
 POLL_OK_MS = 30_000
 POLL_RETRY_MS = 5_000
@@ -98,9 +102,11 @@ APP_GONE_GRACE_SEC = 3.0
 
 DEFAULT_PREFS = {
     "mode": "used",             # "used" | "remaining"
-    "dock": "docked",           # "docked" | "float"
+    "dock": "docked",           # "docked" | "float" | "taskbar"
     "theme": "system",          # "system" | "light" | "dark"
     "float_pos": None,          # [x, y] or None
+    "taskbar_x": None,          # int or None (logical x inside taskbar)
+    "pinned_pods": ["antigravity", "codex"],
     "auto_exit_with_app": True, # exit when Antigravity closes
 }
 
@@ -123,21 +129,21 @@ PALETTES = {
         "shadow_float": QColor(15, 23, 42, 82),
     },
     "dark": {
-        "card_bg": "#21242a",
-        "card_alt": "#282c34",
-        "fg": "#f3f4f6",
-        "muted": "#9ca3af",
-        "border": "#2f343e",
-        "track": "#323741",
-        "accent": "#3b82f6",
-        "accent_soft": "rgba(59, 130, 246, 0.20)",
+        "card_bg": "#13151b",
+        "card_alt": "#1b1f29",
+        "fg": "#f1f5f9",
+        "muted": "#94a3b8",
+        "border": "#292e3b",
+        "track": "#232836",
+        "accent": "#60a5fa",
+        "accent_soft": "rgba(96, 165, 250, 0.18)",
         "accent_fg": "#ffffff",
-        "green": "#22c55e",
+        "green": "#34d399",
         "amber": "#f59e0b",
         "red": "#ef4444",
         "hover": "rgba(255, 255, 255, 0.08)",
-        "shadow_docked": QColor(0, 0, 0, 115),
-        "shadow_float": QColor(0, 0, 0, 170),
+        "shadow_docked": QColor(0, 0, 0, 125),
+        "shadow_float": QColor(0, 0, 0, 185),
     },
 }
 
@@ -149,17 +155,25 @@ def load_prefs() -> dict:
     prefs = dict(DEFAULT_PREFS)
     try:
         if PREFS_FILE.exists():
-            raw = json.loads(PREFS_FILE.read_text(encoding="utf-8"))
+            raw = json.loads(PREFS_FILE.read_text(encoding="utf-8-sig"))
             if isinstance(raw, dict):
                 if raw.get("mode") in ("used", "remaining"):
                     prefs["mode"] = raw["mode"]
-                if raw.get("dock") in ("docked", "float"):
+                if raw.get("dock") in ("docked", "float", "taskbar"):
                     prefs["dock"] = raw["dock"]
                 if raw.get("theme") in ("system", "light", "dark"):
                     prefs["theme"] = raw["theme"]
                 fp = raw.get("float_pos")
                 if isinstance(fp, list) and len(fp) == 2 and all(isinstance(v, (int, float)) for v in fp):
                     prefs["float_pos"] = [int(fp[0]), int(fp[1])]
+                tx = raw.get("taskbar_x")
+                if isinstance(tx, (int, float)):
+                    prefs["taskbar_x"] = int(tx)
+                pp = raw.get("pinned_pods")
+                if isinstance(pp, list):
+                    valid = [p for p in pp if p in ("antigravity", "codex")]
+                    if valid:
+                        prefs["pinned_pods"] = valid
                 if isinstance(raw.get("auto_exit_with_app"), bool):
                     prefs["auto_exit_with_app"] = raw["auto_exit_with_app"]
     except Exception:
@@ -1147,14 +1161,61 @@ def paint_soft_shadow(widget: QWidget, target_rect: QRect, radius: float, is_flo
     p.end()
 
 
+def _build_antigravity_icon_path(scale: float = 1.0) -> QPainterPath:
+    """Smooth Antigravity ribbon 'A' arch path centered at (0, 0)."""
+    s = scale
+    path = QPainterPath()
+    path.moveTo(-8.2 * s, 7.6 * s)
+    path.cubicTo(-4.8 * s, 6.2 * s, -3.6 * s, -7.8 * s, 0.0, -7.8 * s)
+    path.cubicTo(3.6 * s, -7.8 * s, 4.8 * s, 6.2 * s, 8.2 * s, 7.6 * s)
+    path.cubicTo(5.8 * s, 8.2 * s, 4.4 * s, 6.4 * s, 3.0 * s, 3.4 * s)
+    path.cubicTo(1.7 * s, 0.6 * s, -1.7 * s, 0.6 * s, -3.0 * s, 3.4 * s)
+    path.cubicTo(-4.4 * s, 6.4 * s, -5.8 * s, 8.2 * s, -8.2 * s, 7.6 * s)
+    path.closeSubpath()
+    return path
+
+
+def _draw_antigravity_logo(p: QPainter, cx: float, cy: float, size: float, color: QColor) -> None:
+    p.save()
+    p.translate(cx, cy + size * 0.03)
+    path = _build_antigravity_icon_path(size / 20.0)
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    p.drawPath(path)
+    p.restore()
+
+
+def _draw_openai_logo(p: QPainter, cx: float, cy: float, size: float, color: QColor) -> None:
+    p.save()
+    p.translate(cx, cy)
+    r = size * 0.46
+    pen_w = max(1.3, size * 0.105)
+    p.setBrush(Qt.NoBrush)
+    p.setPen(QPen(color, pen_w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    for i in range(6):
+        p.save()
+        p.rotate(i * 60 + 15)
+        path = QPainterPath()
+        path.moveTo(-r * 0.28, -r * 0.48)
+        path.lineTo(r * 0.46, -r * 0.48)
+        path.cubicTo(r * 0.96, -r * 0.48, r * 1.02, r * 0.14, r * 0.52, r * 0.36)
+        path.lineTo(r * 0.14, r * 0.14)
+        p.drawPath(path)
+        p.restore()
+    p.restore()
+
+
 class MiniQuotaCard(QWidget):
-    """Compact always-on-top mini card docked to Antigravity bottom-left or floating."""
+    """Minimal Split-Capsule dual-ring dock (Antigravity + OpenAI Codex)."""
 
     toggled_expand = pyqtSignal()
     toggled_dock = pyqtSignal()
+    drag_started = pyqtSignal()
     moved_while_dragging = pyqtSignal()
     drag_finished = pyqtSignal(int, int)
     context_menu_requested = pyqtSignal(QPoint)
+    hover_entered = pyqtSignal()
+    hover_left = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1165,272 +1226,310 @@ class MiniQuotaCard(QWidget):
         self.setCursor(Qt.PointingHandCursor)
 
         self._dock_mode = "docked"
-        self._theme = "light"
+        self._theme = "dark"
         self._mode = "used"
         self._expanded = False
+        self._hovered = False
+        self._tb_height = 32
+        self._pinned_pods = ["antigravity", "codex"]
         self._dragging = False
         self._drag_moved = False
         self._press_global = QPoint()
         self._press_win = QPoint()
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN, SHADOW_MARGIN)
-        outer.setSpacing(0)
+        self._left_data = {
+            "kind": "antigravity",
+            "fh_pct": 0.0,
+            "fh_used": 0.0,
+            "wk_pct": None,
+            "fh_reset_text": "--",
+            "has_data": False,
+        }
+        self._right_data = {
+            "kind": "codex",
+            "fh_pct": 0.0,
+            "fh_used": 0.0,
+            "wk_pct": None,
+            "fh_reset_text": "--",
+            "has_data": False,
+        }
+        self._stale = False
+        self._error_msg = None
 
-        self.surface = QFrame()
-        self.surface.setObjectName("miniSurface")
-        self.surface.setFixedWidth(MINI_VIS_WIDTH)
-        outer.addWidget(self.surface)
+        self.setFixedSize(
+            MINI_VIS_WIDTH + SHADOW_MARGIN * 2,
+            MINI_VIS_HEIGHT + SHADOW_MARGIN * 2,
+        )
+        self.apply_theme("dark", "docked")
 
-        root = QVBoxLayout(self.surface)
-        root.setContentsMargins(10, 9, 10, 8)
-        root.setSpacing(6)
+    def _calc_vis_width(self) -> int:
+        count = max(1, len(self._pinned_pods))
+        in_tb = self._dock_mode == "taskbar" and not self._drag_moved
+        pod_w = 61 if in_tb else 66
+        return pod_w * count + 6
 
-        # Header row
-        head = QHBoxLayout()
-        head.setContentsMargins(0, 0, 0, 0)
-        head.setSpacing(5)
-
-        self.grip_lbl = QLabel("::")
-        self.grip_lbl.setToolTip("按住可拖拽悬浮位置")
-        self.grip_lbl.setVisible(False)
-        head.addWidget(self.grip_lbl)
-
-        self.dot_lbl = QLabel()
-        self.dot_lbl.setFixedSize(8, 8)
-        head.addWidget(self.dot_lbl)
-
-        self.model_lbl = QLabel("加载中...")
-        self.model_lbl.setMinimumWidth(40)
-        self.model_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        head.addWidget(self.model_lbl, 1)
-
-        self.tier_lbl = QLabel("")
-        self.tier_lbl.setVisible(False)
-        head.addWidget(self.tier_lbl)
-
-        self.dock_btn = QPushButton("钉")
-        self.dock_btn.setFixedSize(20, 18)
-        self.dock_btn.setToolTip("切换 吸附左下角 / 自由悬浮")
-        self.dock_btn.setCursor(Qt.PointingHandCursor)
-        self.dock_btn.clicked.connect(self.toggled_dock.emit)
-        head.addWidget(self.dock_btn)
-
-        root.addLayout(head)
-
-        # Status notice (used while connecting / error without cache)
-        self.status_lbl = QLabel("正在连接本地配额服务...")
-        self.status_lbl.setWordWrap(True)
-        root.addWidget(self.status_lbl)
-
-        # 5h meter container
-        self.fh_widget = QWidget()
-        fh_lay = QVBoxLayout(self.fh_widget)
-        fh_lay.setContentsMargins(0, 0, 0, 0)
-        fh_lay.setSpacing(3)
-        fh_top = QHBoxLayout()
-        fh_top.setContentsMargins(0, 0, 0, 0)
-        fh_top.setSpacing(4)
-        self.fh_title = QLabel("5h")
-        self.fh_val = QLabel("--")
-        self.fh_cd = QLabel("")
-        fh_top.addWidget(self.fh_title)
-        fh_top.addStretch(1)
-        fh_top.addWidget(self.fh_val)
-        fh_top.addWidget(self.fh_cd)
-        self.fh_bar = QuotaProgressBar()
-        fh_lay.addLayout(fh_top)
-        fh_lay.addWidget(self.fh_bar)
-        root.addWidget(self.fh_widget)
-
-        self.fh_note = QLabel("5h: 仅周限额")
-        self.fh_note.setVisible(False)
-        root.addWidget(self.fh_note)
-
-        # Weekly meter container
-        self.wk_widget = QWidget()
-        wk_lay = QVBoxLayout(self.wk_widget)
-        wk_lay.setContentsMargins(0, 0, 0, 0)
-        wk_lay.setSpacing(3)
-        wk_top = QHBoxLayout()
-        wk_top.setContentsMargins(0, 0, 0, 0)
-        wk_top.setSpacing(4)
-        self.wk_title = QLabel("1周")
-        self.wk_val = QLabel("--")
-        self.wk_cd = QLabel("")
-        wk_top.addWidget(self.wk_title)
-        wk_top.addStretch(1)
-        wk_top.addWidget(self.wk_val)
-        wk_top.addWidget(self.wk_cd)
-        self.wk_bar = QuotaProgressBar()
-        wk_lay.addLayout(wk_top)
-        wk_lay.addWidget(self.wk_bar)
-        root.addWidget(self.wk_widget)
-
-        # Divider + Footer cue
-        self.divider = QFrame()
-        self.divider.setFixedHeight(1)
-        root.addWidget(self.divider)
-
-        foot = QHBoxLayout()
-        foot.setContentsMargins(0, 1, 0, 0)
-        foot.setSpacing(4)
-        self.hint_lbl = QLabel("点击展开全部模型")
-        self.chevron_lbl = QLabel(">")
-        foot.addWidget(self.hint_lbl)
-        foot.addStretch(1)
-        foot.addWidget(self.chevron_lbl)
-        root.addLayout(foot)
-
-        self.apply_theme("light", "docked")
+    def _sync_fixed_size(self) -> None:
+        w = self._calc_vis_width() + SHADOW_MARGIN * 2
+        h = MINI_VIS_HEIGHT + SHADOW_MARGIN * 2
+        if self.width() != w or self.height() != h:
+            self.setFixedSize(w, h)
 
     def visible_size(self) -> tuple[int, int]:
-        return self.surface.width(), self.surface.height()
+        return self._calc_vis_width(), MINI_VIS_HEIGHT
+
+    def set_pinned_pods(self, pods: list[str]) -> None:
+        valid = [p for p in pods if p in ("antigravity", "codex")]
+        self._pinned_pods = valid or ["antigravity"]
+        self._sync_fixed_size()
+        self.update()
 
     def apply_theme(self, theme: str, dock_mode: str) -> None:
         self._theme = theme
         self._dock_mode = dock_mode
-        pal = PALETTES[theme]
-        is_float = dock_mode == "float"
-
-        border_col = pal["accent"] if is_float else pal["border"]
-        self.surface.setStyleSheet(
-            f"#miniSurface {{ background: {pal['card_bg']}; border: 1px solid {border_col}; "
-            f"border-radius: 11px; }}"
-        )
+        self._sync_fixed_size()
         self.update()
 
-        self.grip_lbl.setVisible(is_float)
-        self.grip_lbl.setStyleSheet(f"color: {pal['muted']}; font-size: 11px;")
+    def _extract_group_metrics(self, group: dict | None, fallback_fh=None, fallback_wk=None) -> dict:
+        fh = (group.get("fiveHour") if isinstance(group, dict) else None) or fallback_fh
+        wk = (group.get("weekly") if isinstance(group, dict) else None) or fallback_wk
+        is_used = self._mode == "used"
 
-        self.model_lbl.setStyleSheet(f"color: {pal['fg']}; font-size: 12px; font-weight: 600;")
-        self.tier_lbl.setStyleSheet(
-            f"background: {pal['accent_soft']}; color: {pal['accent']}; border-radius: 4px; "
-            f"padding: 1px 5px; font-size: 11px; font-weight: 600;"
-        )
+        if fh:
+            fh_used = float(fh.get("usedPercent") or 0.0)
+            fh_rem = float(fh.get("remainingPercent") if fh.get("remainingPercent") is not None else max(0.0, 100.0 - fh_used))
+            fh_pct = fh_used if is_used else fh_rem
+            reset_ms = fh.get("resetMs")
+            cd = fmt_short_countdown(reset_ms)
+            fh_reset_text = cd if cd else ("已重置" if fh_used <= 0 else "--")
+            fh_tip_reset = fmt_full_reset_time(reset_ms)
+        else:
+            fh_used = 0.0
+            fh_pct = 0.0
+            fh_reset_text = "--"
+            fh_tip_reset = ""
 
-        self.dock_btn.setText("浮" if is_float else "钉")
-        self.dock_btn.setStyleSheet(
-            f"QPushButton {{ background: {pal['card_alt']}; color: {pal['muted']}; border: none; "
-            f"border-radius: 4px; font-size: 11px; font-weight: 600; }}"
-            f"QPushButton:hover {{ background: {pal['hover']}; color: {pal['fg']}; }}"
-        )
+        if wk:
+            wk_used = float(wk.get("usedPercent") or 0.0)
+            wk_rem = float(wk.get("remainingPercent") if wk.get("remainingPercent") is not None else max(0.0, 100.0 - wk_used))
+            wk_pct = wk_used if is_used else wk_rem
+        else:
+            wk_pct = None
 
-        self.status_lbl.setStyleSheet(f"color: {pal['muted']}; font-size: 11.5px;")
-        self.fh_title.setStyleSheet(f"color: {pal['muted']}; font-size: 11.5px; font-weight: 500;")
-        self.wk_title.setStyleSheet(f"color: {pal['muted']}; font-size: 11.5px; font-weight: 500;")
-        self.fh_val.setStyleSheet(f"color: {pal['fg']}; font-size: 12px; font-weight: 600;")
-        self.wk_val.setStyleSheet(f"color: {pal['fg']}; font-size: 12px; font-weight: 600;")
-        self.fh_cd.setStyleSheet(f"color: {pal['muted']}; font-size: 11px;")
-        self.wk_cd.setStyleSheet(f"color: {pal['muted']}; font-size: 11px;")
-        self.fh_note.setStyleSheet(
-            f"background: {pal['card_alt']}; color: {pal['muted']}; border-radius: 5px; "
-            f"padding: 3px 7px; font-size: 11px;"
-        )
-        self.divider.setStyleSheet(f"background: {pal['border']}; border: none;")
-        self.hint_lbl.setStyleSheet(f"color: {pal['muted']}; font-size: 11px;")
-        self.chevron_lbl.setStyleSheet(f"color: {pal['muted']}; font-size: 12px;")
+        return {
+            "fh_pct": fh_pct,
+            "fh_used": fh_used,
+            "wk_pct": wk_pct,
+            "fh_reset_text": fh_reset_text,
+            "fh_tip_reset": fh_tip_reset,
+            "has_data": bool(fh or wk),
+        }
 
     def update_data(self, payload: dict | None, error_msg: str | None, mode: str, expanded: bool) -> None:
         self._mode = mode
         self._expanded = expanded
-        pal = PALETTES[self._theme]
+        self._error_msg = error_msg
+        self._stale = bool((payload or {}).get("stale") or error_msg)
 
-        self.hint_lbl.setText("点击收起全部模型" if expanded else "点击展开全部模型")
-        self.chevron_lbl.setText("<" if expanded else ">")
+        groups = (payload or {}).get("groups") or []
+        cur = (payload or {}).get("current") or {}
 
-        has_groups = bool(payload and payload.get("groups"))
-        if not has_groups:
-            dot_col = pal["red"] if error_msg else pal["amber"]
-            self.dot_lbl.setStyleSheet(f"background: {dot_col}; border-radius: 4px;")
-            self.model_lbl.setText("Antigravity 用量")
-            self.tier_lbl.setVisible(False)
-            self.fh_widget.setVisible(False)
-            self.fh_note.setVisible(False)
-            self.wk_widget.setVisible(False)
-            self.status_lbl.setVisible(True)
-            self.status_lbl.setText("等待 Antigravity 连接..." if error_msg else "正在获取配额信息...")
-            self.adjustSize()
-            return
+        gemini_grp = None
+        codex_grp = None
+        for g in groups:
+            gid = str(g.get("id") or "").lower()
+            gname = str(g.get("displayName") or "").lower()
+            if g.get("externalSource") == "codex" or "codex" in gid or "codex" in gname:
+                codex_grp = g
+            elif gemini_grp is None:
+                gemini_grp = g
 
-        self.status_lbl.setVisible(False)
-        stale = bool(payload.get("stale") or error_msg)
-        dot_col = pal["amber"] if stale else pal["accent"]
-        self.dot_lbl.setStyleSheet(f"background: {dot_col}; border-radius: 4px;")
+        self._left_data = {
+            "kind": "antigravity",
+            **self._extract_group_metrics(gemini_grp, cur.get("fiveHour"), cur.get("weekly")),
+        }
+        self._right_data = {
+            "kind": "codex",
+            **self._extract_group_metrics(codex_grp),
+        }
 
-        cur = payload.get("current") or {}
-        full_label = cur.get("label") or "当前模型"
-        short_name, tier = split_model_short_and_tier(full_label)
+        self.setToolTip("")
+        self.update()
 
-        elide_font = QFont(self.model_lbl.font())
-        elide_font.setPixelSize(12)
-        elide_font.setWeight(QFont.DemiBold)
-        fm = QFontMetrics(elide_font)
-        elided = fm.elidedText(short_name, Qt.ElideRight, 130 if tier else 164)
-        self.model_lbl.setText(elided)
-        self.model_lbl.setToolTip(f"{full_label} ({cur.get('groupName') or ''})")
+    def _ring_color(self, base_hex: str, used_pct: float) -> QColor:
+        if used_pct >= 90.0:
+            return QColor("#ef4444")
+        if used_pct >= 75.0:
+            return QColor("#f59e0b")
+        return QColor(base_hex)
 
-        if tier:
-            self.tier_lbl.setText(tier)
-            self.tier_lbl.setVisible(True)
+    def set_taskbar_height(self, tb_h: int) -> None:
+        self._tb_height = max(26, min(32, int(tb_h) - 4))
+        self.update()
+
+    def _paint_pod(
+        self,
+        p: QPainter,
+        pod_left: float,
+        cy_mid: float,
+        data: dict,
+        base_accent: str,
+        is_dark: bool,
+        compact_tb: bool = False,
+    ) -> None:
+        rad = 10.0 if compact_tb else 11.5
+        ring_cx = pod_left + (14.5 if compact_tb else 16.5)
+        ring_rect = QRectF(ring_cx - rad, cy_mid - rad, rad * 2, rad * 2)
+
+        track_col = QColor("#232733") if is_dark else QColor("#e2e8f0")
+        icon_col = QColor("#f1f5f9") if is_dark else QColor("#1e293b")
+        week_col = QColor("#cbd5e1") if is_dark else QColor("#334155")
+        reset_col = QColor("#64748b") if is_dark else QColor("#64748b")
+
+        stroke = 2.1 if compact_tb else 2.4
+        p.save()
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(track_col, stroke, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(ring_rect, 0, 360 * 16)
+
+        pct = float(data.get("fh_pct") or 0.0)
+        if data.get("has_data") and pct > 0.0:
+            arc_col = self._ring_color(base_accent, float(data.get("fh_used") or 0.0))
+            p.setPen(QPen(arc_col, stroke, Qt.SolidLine, Qt.RoundCap))
+            span = int(-360 * 16 * max(0.04, min(1.0, pct / 100.0)))
+            p.drawArc(ring_rect, 90 * 16, span)
+        p.restore()
+
+        if data.get("kind") == "antigravity":
+            _draw_antigravity_logo(p, ring_cx, cy_mid, 9.5 if compact_tb else 11.0, icon_col)
         else:
-            self.tier_lbl.setVisible(False)
+            _draw_openai_logo(p, ring_cx, cy_mid, 10.5 if compact_tb else 12.0, icon_col)
 
-        self._bind_meter(
-            bucket=cur.get("fiveHour"),
-            container=self.fh_widget,
-            note=self.fh_note,
-            val_lbl=self.fh_val,
-            cd_lbl=self.fh_cd,
-            bar=self.fh_bar,
-            is_five_hour=True,
+        tx = ring_cx + (12.5 if compact_tb else 14.5)
+        wk_val = data.get("wk_pct")
+        wk_txt = f"周{wk_val:.0f}%" if wk_val is not None else "周--"
+        f_wk = QFont("Microsoft YaHei UI")
+        f_wk.setPixelSize(8 if compact_tb else 9)
+        f_wk.setWeight(QFont.DemiBold)
+        p.setFont(f_wk)
+        p.setPen(week_col)
+        p.drawText(
+            QRectF(tx, cy_mid - (12.0 if compact_tb else 13.5), 36, 12 if compact_tb else 14),
+            Qt.AlignVCenter | Qt.AlignLeft,
+            wk_txt,
         )
-        self._bind_meter(
-            bucket=cur.get("weekly"),
-            container=self.wk_widget,
-            note=None,
-            val_lbl=self.wk_val,
-            cd_lbl=self.wk_cd,
-            bar=self.wk_bar,
-            is_five_hour=False,
+
+        rst_txt = data.get("fh_reset_text") or "--"
+        f_rst = QFont("Segoe UI")
+        f_rst.setPixelSize(7 if compact_tb else 8)
+        p.setFont(f_rst)
+        p.setPen(reset_col)
+        p.drawText(
+            QRectF(tx, cy_mid + (0.0 if compact_tb else 0.5), 36, 11 if compact_tb else 13),
+            Qt.AlignVCenter | Qt.AlignLeft,
+            rst_txt,
         )
-        self.adjustSize()
-
-    def _bind_meter(self, bucket, container, note, val_lbl, cd_lbl, bar, is_five_hour: bool) -> None:
-        pal = PALETTES[self._theme]
-        if not bucket:
-            container.setVisible(False)
-            if note is not None and is_five_hour:
-                note.setVisible(True)
-            return
-
-        if note is not None:
-            note.setVisible(False)
-        container.setVisible(True)
-
-        used = float(bucket.get("usedPercent") or 0.0)
-        rem = float(bucket.get("remainingPercent") if bucket.get("remainingPercent") is not None else max(0.0, 100.0 - used))
-        is_used = self._mode == "used"
-        primary_val = used if is_used else rem
-        prefix = "已用" if is_used else "剩余"
-        val_lbl.setText(f"{prefix} {fmt_pct(primary_val)}")
-
-        reset_ms = bucket.get("resetMs")
-        cd_lbl.setText(fmt_short_countdown(reset_ms))
-        tip = fmt_full_reset_time(reset_ms)
-        if tip:
-            container.setToolTip(tip)
-
-        bar.set_state(primary_val, pal["track"], pal[tone_color_key(used)])
 
     def paintEvent(self, _event):
-        paint_soft_shadow(
-            self,
-            self.surface.geometry(),
-            11.0,
-            self._dock_mode == "float",
-            self._theme,
-        )
+        in_taskbar = self._dock_mode == "taskbar" and not self._drag_moved
+        vis_w = self._calc_vis_width()
+        if in_taskbar:
+            vis_h = self._tb_height
+            y_off = SHADOW_MARGIN + (MINI_VIS_HEIGHT - vis_h) // 2
+            surface_rect = QRect(SHADOW_MARGIN, y_off, vis_w, vis_h)
+            radius = 5.0
+        else:
+            surface_rect = QRect(SHADOW_MARGIN, SHADOW_MARGIN, vis_w, MINI_VIS_HEIGHT)
+            radius = MINI_VIS_HEIGHT / 2.0
+
+        if not in_taskbar:
+            paint_soft_shadow(
+                self,
+                surface_rect,
+                radius,
+                self._dock_mode == "float",
+                self._theme,
+            )
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setRenderHint(QPainter.TextAntialiasing, True)
+
+        is_dark = self._theme == "dark"
+        rect = QRectF(surface_rect)
+        path = QPainterPath()
+        path.addRoundedRect(rect, radius, radius)
+
+        if in_taskbar:
+            if self._hovered or self._expanded:
+                bg = QColor(255, 255, 255, 16) if is_dark else QColor(0, 0, 0, 12)
+                bd = QColor(255, 255, 255, 22) if is_dark else QColor(0, 0, 0, 18)
+            else:
+                bg = QColor(255, 255, 255, 1)
+                bd = QColor(0, 0, 0, 0)
+            p.fillPath(path, bg)
+            if bd.alpha() > 0:
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(bd, 1.0))
+                p.drawPath(path)
+        else:
+            bg = QColor(19, 21, 27, 242) if is_dark else QColor(255, 255, 255, 244)
+            p.fillPath(path, bg)
+
+            if is_dark:
+                grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+                grad.setColorAt(0.0, QColor(255, 255, 255, 16))
+                grad.setColorAt(0.35, QColor(255, 255, 255, 0))
+                p.fillPath(path, grad)
+
+            if self._expanded:
+                bd = QColor("#60a5fa") if is_dark else QColor("#2563eb")
+                bd.setAlpha(200)
+            elif self._dock_mode == "float":
+                bd = QColor("#3b4459") if is_dark else QColor("#cbd5e1")
+                bd.setAlpha(220)
+            else:
+                bd = QColor("#292e3b") if is_dark else QColor("#e2e8f0")
+                bd.setAlpha(215)
+
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(bd, 1.0))
+            p.drawPath(path)
+
+        pods_to_draw = []
+        if "antigravity" in self._pinned_pods:
+            pods_to_draw.append((self._left_data, "#60a5fa"))
+        if "codex" in self._pinned_pods:
+            pods_to_draw.append((self._right_data, "#34d399"))
+        if not pods_to_draw:
+            pods_to_draw.append((self._left_data, "#60a5fa"))
+
+        cy_mid = rect.top() + rect.height() / 2.0
+        if len(pods_to_draw) == 2:
+            div_col = QColor(255, 255, 255, 18) if is_dark else QColor(15, 23, 42, 22)
+            mid_x = rect.left() + rect.width() / 2.0
+            div_pad = 6.0 if in_taskbar else 9.0
+            p.setPen(QPen(div_col, 1.0))
+            p.drawLine(QPointF(mid_x, rect.top() + div_pad), QPointF(mid_x, rect.bottom() - div_pad))
+            self._paint_pod(p, rect.left() + 3.0, cy_mid, pods_to_draw[0][0], pods_to_draw[0][1], is_dark, compact_tb=in_taskbar)
+            self._paint_pod(p, mid_x + 2.0, cy_mid, pods_to_draw[1][0], pods_to_draw[1][1], is_dark, compact_tb=in_taskbar)
+        else:
+            self._paint_pod(p, rect.left() + 3.0, cy_mid, pods_to_draw[0][0], pods_to_draw[0][1], is_dark, compact_tb=in_taskbar)
+
+        p.end()
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        if not self._dragging:
+            self.hover_entered.emit()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        if not self._dragging:
+            self.hover_left.emit()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -1449,8 +1548,12 @@ class MiniQuotaCard(QWidget):
     def mouseMoveEvent(self, event):
         if self._dragging and (event.buttons() & Qt.LeftButton):
             delta = event.globalPos() - self._press_global
-            if self._dock_mode == "float" and (abs(delta.x()) >= 5 or abs(delta.y()) >= 5):
-                self._drag_moved = True
+            if self._dock_mode in ("float", "taskbar") and (abs(delta.x()) >= 5 or abs(delta.y()) >= 5):
+                if not self._drag_moved:
+                    self._drag_moved = True
+                    self._sync_fixed_size()
+                    self.drag_started.emit()
+                    self.update()
             if self._drag_moved:
                 self.move(self._press_win + delta)
                 self.moved_while_dragging.emit()
@@ -1472,12 +1575,73 @@ class MiniQuotaCard(QWidget):
         super().mouseReleaseEvent(event)
 
 
+def _make_mini_icon(kind: str, color_hex: str, filled: bool = False, size: int = 16) -> QIcon:
+    """Draw crisp vector icons (user / refresh / pin) at 2x resolution for HiDPI."""
+    scale = 2
+    s = size * scale
+    pm = QPixmap(s, s)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    col = QColor(color_hex)
+    pen = QPen(col, 1.5 * scale, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+
+    cx, cy = s / 2.0, s / 2.0
+    if kind == "user":
+        # Minimalist head + shoulders
+        p.drawEllipse(QPointF(cx, cy - 2.6 * scale), 2.3 * scale, 2.3 * scale)
+        arc = QPainterPath()
+        arc.moveTo(cx - 4.5 * scale, cy + 4.8 * scale)
+        arc.cubicTo(cx - 4.2 * scale, cy + 1.2 * scale, cx + 4.2 * scale, cy + 1.2 * scale, cx + 4.5 * scale, cy + 4.8 * scale)
+        p.drawPath(arc)
+    elif kind == "refresh":
+        # Minimalist circular refresh arrow
+        rad = 4.2 * scale
+        rect = QRectF(cx - rad, cy - rad, rad * 2, rad * 2)
+        p.drawArc(rect, 35 * 16, 290 * 16)
+        # Arrowhead at top-right
+        ax, ay = cx + 3.4 * scale, cy - 2.6 * scale
+        p.drawLine(QPointF(ax, ay), QPointF(ax - 2.4 * scale, ay - 0.3 * scale))
+        p.drawLine(QPointF(ax, ay), QPointF(ax + 0.3 * scale, ay - 2.4 * scale))
+    elif kind == "pin":
+        # Minimalist pushpin (tilted 38 deg when unpinned, upright & filled when pinned)
+        p.save()
+        p.translate(cx, cy)
+        if not filled:
+            p.rotate(38)
+        # Pin head
+        head = QPainterPath()
+        head.moveTo(-2.5 * scale, -4.4 * scale)
+        head.lineTo(2.5 * scale, -4.4 * scale)
+        head.lineTo(1.8 * scale, -1.2 * scale)
+        head.lineTo(3.2 * scale, 0.6 * scale)
+        head.lineTo(-3.2 * scale, 0.6 * scale)
+        head.lineTo(-1.8 * scale, -1.2 * scale)
+        head.closeSubpath()
+        if filled:
+            p.setBrush(col)
+        p.drawPath(head)
+        # Pin needle
+        p.drawLine(QPointF(0, 0.8 * scale), QPointF(0, 4.8 * scale))
+        p.restore()
+
+    p.end()
+    pm.setDevicePixelRatio(scale)
+    return QIcon(pm)
+
+
 class ExpandedPopover(QWidget):
     """Expanded floating card displaying all model groups and local account switching."""
 
     closed_requested = pyqtSignal()
     mode_toggled = pyqtSignal()
     refresh_requested = pyqtSignal()
+    pin_toggled = pyqtSignal()
+    pod_pin_toggled = pyqtSignal(str)
+    hover_entered = pyqtSignal()
+    hover_left = pyqtSignal()
     tab_changed = pyqtSignal(str)
     size_changed = pyqtSignal()
     capture_account_requested = pyqtSignal()
@@ -1489,9 +1653,12 @@ class ExpandedPopover(QWidget):
         self.setWindowTitle("全部模型用量")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
 
         self._theme = "light"
         self._mode = "used"
+        self._pinned = False
+        self._pinned_pods = ["antigravity", "codex"]
         self._active_tab = "quota"
         self._payload: dict | None = None
         self._accounts_data: dict | None = None
@@ -1510,15 +1677,15 @@ class ExpandedPopover(QWidget):
         outer.addWidget(self.surface)
 
         root = QVBoxLayout(self.surface)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(6)
 
         # Header
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
-        head.setSpacing(6)
+        head.setSpacing(4)
 
-        self.title_lbl = QLabel("模型与账号")
+        self.title_lbl = QLabel("模型用量")
         head.addWidget(self.title_lbl)
 
         self.plan_lbl = QLabel("")
@@ -1527,25 +1694,39 @@ class ExpandedPopover(QWidget):
 
         head.addStretch(1)
 
-        self.mode_btn = QPushButton("已用视角")
-        self.mode_btn.setCursor(Qt.PointingHandCursor)
-        self.mode_btn.setToolTip("点击切换 已用 / 剩余 显示")
+        self.mode_btn = QPushButton("已用")
+        self.mode_btn.setVisible(False)
         self.mode_btn.clicked.connect(self.mode_toggled.emit)
-        head.addWidget(self.mode_btn)
 
-        self.refresh_btn = QPushButton("刷新")
-        self.refresh_btn.setFixedSize(36, 20)
+        self.acc_toggle_btn = QPushButton("")
+        self.acc_toggle_btn.setFixedSize(20, 20)
+        self.acc_toggle_btn.setIconSize(QSize(13, 13))
+        self.acc_toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.acc_toggle_btn.setToolTip("账号切换 / 管理")
+        self.acc_toggle_btn.clicked.connect(
+            lambda: self._select_tab("quota" if self._active_tab == "accounts" else "accounts")
+        )
+        head.addWidget(self.acc_toggle_btn)
+
+        self.refresh_btn = QPushButton("")
+        self.refresh_btn.setFixedSize(20, 20)
+        self.refresh_btn.setIconSize(QSize(13, 13))
         self.refresh_btn.setCursor(Qt.PointingHandCursor)
-        self.refresh_btn.setToolTip("立即刷新配额与账号状态")
+        self.refresh_btn.setToolTip("立即刷新配额")
         self.refresh_btn.clicked.connect(self.refresh_requested.emit)
         head.addWidget(self.refresh_btn)
 
+        self.pin_btn = QPushButton("")
+        self.pin_btn.setFixedSize(20, 20)
+        self.pin_btn.setIconSize(QSize(13, 13))
+        self.pin_btn.setCursor(Qt.PointingHandCursor)
+        self.pin_btn.setToolTip("置顶常驻显示（取消则鼠标挪开自动隐藏）")
+        self.pin_btn.clicked.connect(self.pin_toggled.emit)
+        head.addWidget(self.pin_btn)
+
         self.close_btn = QPushButton("×")
-        self.close_btn.setFixedSize(22, 20)
-        self.close_btn.setCursor(Qt.PointingHandCursor)
-        self.close_btn.setToolTip("收起 (Esc)")
+        self.close_btn.setVisible(False)
         self.close_btn.clicked.connect(self.closed_requested.emit)
-        head.addWidget(self.close_btn)
 
         root.addLayout(head)
 
@@ -1553,23 +1734,18 @@ class ExpandedPopover(QWidget):
         self.head_line.setFixedHeight(1)
         root.addWidget(self.head_line)
 
-        # Segmented tab switcher: 模型配额 | 账号切换
+        # Hidden legacy tab_bar kept for compatibility
         self.tab_bar = QFrame()
         self.tab_bar.setObjectName("popoverTabBar")
+        self.tab_bar.setVisible(False)
         tab_lay = QHBoxLayout(self.tab_bar)
-        tab_lay.setContentsMargins(3, 3, 3, 3)
-        tab_lay.setSpacing(4)
-
+        tab_lay.setContentsMargins(0, 0, 0, 0)
         self.tab_quota_btn = QPushButton("模型配额")
-        self.tab_quota_btn.setCursor(Qt.PointingHandCursor)
         self.tab_quota_btn.clicked.connect(lambda: self._select_tab("quota"))
-        tab_lay.addWidget(self.tab_quota_btn, 1)
-
+        tab_lay.addWidget(self.tab_quota_btn)
         self.tab_accounts_btn = QPushButton("账号切换 (0)")
-        self.tab_accounts_btn.setCursor(Qt.PointingHandCursor)
         self.tab_accounts_btn.clicked.connect(lambda: self._select_tab("accounts"))
-        tab_lay.addWidget(self.tab_accounts_btn, 1)
-        root.addWidget(self.tab_bar)
+        tab_lay.addWidget(self.tab_accounts_btn)
 
         # Groups / accounts container (wrapped in borderless scroll area)
         self.scroll = QScrollArea()
@@ -1579,24 +1755,26 @@ class ExpandedPopover(QWidget):
         self.scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
 
         self.groups_host = QWidget()
-        self.groups_host.setFixedWidth(POPOVER_VIS_WIDTH - 24)
+        self.groups_host.setFixedWidth(POPOVER_VIS_WIDTH - 20)
         self.groups_host.setStyleSheet("background: transparent;")
         self.groups_layout = QVBoxLayout(self.groups_host)
         self.groups_layout.setContentsMargins(0, 0, 0, 0)
-        self.groups_layout.setSpacing(8)
+        self.groups_layout.setSpacing(6)
         self.scroll.setWidget(self.groups_host)
         root.addWidget(self.scroll)
 
-        # Footer
-        foot = QHBoxLayout()
-        foot.setContentsMargins(0, 2, 0, 0)
-        foot.setSpacing(6)
-        self.foot_note = QLabel("同组模型共享 5h 与一周配额")
+        # Compact footer (hidden on quota view to keep popover ultra-slim)
+        self.foot_widget = QWidget()
+        foot = QHBoxLayout(self.foot_widget)
+        foot.setContentsMargins(0, 0, 0, 0)
+        foot.setSpacing(4)
+        self.foot_note = QLabel("")
         self.foot_time = QLabel("")
         foot.addWidget(self.foot_note)
         foot.addStretch(1)
         foot.addWidget(self.foot_time)
-        root.addLayout(foot)
+        self.foot_widget.setVisible(False)
+        root.addWidget(self.foot_widget)
 
         self.apply_theme("light")
 
@@ -1660,16 +1838,7 @@ class ExpandedPopover(QWidget):
         acc_count = len((self._accounts_data or {}).get("accounts") or [])
         self.tab_accounts_btn.setText(f"账号切换 ({acc_count})")
         if self._payload:
-            plan_name = (
-                (self._payload.get("tier") or {}).get("planName")
-                or (self._payload.get("tier") or {}).get("name")
-                or ""
-            )
-            if plan_name:
-                self.plan_lbl.setText(plan_name)
-                self.plan_lbl.setVisible(True)
-            else:
-                self.plan_lbl.setVisible(False)
+            self.plan_lbl.setVisible(False)
             self.foot_time.setText(fmt_relative_updated(self._payload.get("fetchedAt")))
         else:
             self.plan_lbl.setVisible(False)
@@ -1677,20 +1846,54 @@ class ExpandedPopover(QWidget):
 
     def _apply_tab_styles(self) -> None:
         pal = PALETTES[self._theme]
-        self.tab_bar.setStyleSheet(
-            f"#popoverTabBar {{ background: {pal['card_alt']}; border: 1px solid {pal['border']}; border-radius: 7px; }}"
+        is_acc = self._active_tab == "accounts"
+        self.acc_toggle_btn.setIcon(_make_mini_icon("user", pal["accent"] if is_acc else pal["muted"], size=13))
+        self.acc_toggle_btn.setToolTip("返回模型配额" if is_acc else "账号切换 / 管理")
+        if is_acc:
+            self.acc_toggle_btn.setStyleSheet(
+                f"QPushButton {{ background: {pal['accent_soft']}; border: none; border-radius: 5px; padding: 0px; }}"
+            )
+        else:
+            self.acc_toggle_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; border: none; border-radius: 5px; padding: 0px; }}"
+                f"QPushButton:hover {{ background: {pal['hover']}; }}"
+            )
+
+    def set_pinned(self, pinned: bool) -> None:
+        self._pinned = bool(pinned)
+        self._apply_pin_style()
+
+    def set_pinned_pods(self, pods: list[str]) -> None:
+        valid = [p for p in pods if p in ("antigravity", "codex")]
+        self._pinned_pods = valid or ["antigravity"]
+        if self._active_tab == "quota" and self._payload is not None:
+            self._schedule_render()
+
+    def _apply_pin_style(self) -> None:
+        pal = PALETTES[self._theme]
+        self.pin_btn.setIcon(
+            _make_mini_icon("pin", pal["accent"] if self._pinned else pal["muted"], filled=self._pinned, size=13)
         )
-        active_css = (
-            f"QPushButton {{ background: {pal['card_bg']}; color: {pal['fg']}; border: none; "
-            f"border-radius: 5px; padding: 3px 8px; font-size: 11.5px; font-weight: 600; }}"
-        )
-        idle_css = (
-            f"QPushButton {{ background: transparent; color: {pal['muted']}; border: none; "
-            f"border-radius: 5px; padding: 3px 8px; font-size: 11.5px; font-weight: 500; }}"
-            f"QPushButton:hover {{ color: {pal['fg']}; }}"
-        )
-        self.tab_quota_btn.setStyleSheet(active_css if self._active_tab == "quota" else idle_css)
-        self.tab_accounts_btn.setStyleSheet(active_css if self._active_tab == "accounts" else idle_css)
+        if self._pinned:
+            self.pin_btn.setToolTip("已常驻置顶（点击取消常驻）")
+            self.pin_btn.setStyleSheet(
+                f"QPushButton {{ background: {pal['accent_soft']}; border: none; border-radius: 5px; padding: 0px; }}"
+                f"QPushButton:hover {{ background: {pal['hover']}; }}"
+            )
+        else:
+            self.pin_btn.setToolTip("置顶常驻显示（未置顶时鼠标挪开自动消失）")
+            self.pin_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; border: none; border-radius: 5px; padding: 0px; }}"
+                f"QPushButton:hover {{ background: {pal['hover']}; }}"
+            )
+
+    def enterEvent(self, event):
+        self.hover_entered.emit()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.hover_left.emit()
+        super().leaveEvent(event)
 
     def apply_theme(self, theme: str) -> None:
         self._theme = theme
@@ -1700,22 +1903,22 @@ class ExpandedPopover(QWidget):
             f"border-radius: 12px; }}"
         )
         self.update()
-        self.title_lbl.setStyleSheet(f"color: {pal['fg']}; font-size: 13px; font-weight: 600;")
+        self.title_lbl.setStyleSheet(f"color: {pal['fg']}; font-size: 11px; font-weight: 600;")
         self.plan_lbl.setStyleSheet(
-            f"background: {pal['accent_soft']}; color: {pal['accent']}; border-radius: 4px; "
-            f"padding: 1px 6px; font-size: 11px; font-weight: 600;"
+            f"background: {pal['accent_soft']}; color: {pal['accent']}; border-radius: 3px; "
+            f"padding: 1px 5px; font-size: 9px; font-weight: 600;"
         )
-        btn_css = (
-            f"QPushButton {{ background: {pal['card_alt']}; color: {pal['muted']}; border: none; "
-            f"border-radius: 5px; padding: 2px 7px; font-size: 11px; font-weight: 500; }}"
-            f"QPushButton:hover {{ background: {pal['hover']}; color: {pal['fg']}; }}"
+        icon_btn_css = (
+            f"QPushButton {{ background: transparent; border: none; border-radius: 5px; padding: 0px; }}"
+            f"QPushButton:hover {{ background: {pal['hover']}; }}"
         )
-        self.mode_btn.setStyleSheet(btn_css)
-        self.refresh_btn.setStyleSheet(btn_css)
-        self.close_btn.setStyleSheet(btn_css.replace("padding: 2px 7px;", "padding: 0px; font-size: 14px;"))
+        self.mode_btn.setStyleSheet(icon_btn_css)
+        self.refresh_btn.setIcon(_make_mini_icon("refresh", pal["muted"], size=13))
+        self.refresh_btn.setStyleSheet(icon_btn_css)
+        self._apply_pin_style()
         self.head_line.setStyleSheet(f"background: {pal['border']}; border: none;")
-        self.foot_note.setStyleSheet(f"color: {pal['muted']}; font-size: 11px;")
-        self.foot_time.setStyleSheet(f"color: {pal['muted']}; font-size: 11px;")
+        self.foot_note.setStyleSheet(f"color: {pal['muted']}; font-size: 9.5px;")
+        self.foot_time.setStyleSheet(f"color: {pal['muted']}; font-size: 9.5px;")
         self._apply_tab_styles()
 
     def _clear_groups(self) -> None:
@@ -1743,12 +1946,7 @@ class ExpandedPopover(QWidget):
         self.tab_accounts_btn.setText(f"账号切换 ({acc_count})")
 
         if payload:
-            plan_name = (payload.get("tier") or {}).get("planName") or (payload.get("tier") or {}).get("name") or ""
-            if plan_name:
-                self.plan_lbl.setText(plan_name)
-                self.plan_lbl.setVisible(True)
-            else:
-                self.plan_lbl.setVisible(False)
+            self.plan_lbl.setVisible(False)
             self.foot_time.setText(fmt_relative_updated(payload.get("fetchedAt")))
         else:
             self.plan_lbl.setVisible(False)
@@ -1758,10 +1956,11 @@ class ExpandedPopover(QWidget):
 
     def _render_current_tab(self) -> None:
         if self._active_tab == "accounts":
-            self.foot_note.setText("纯本地快照 · 切换将重启 Antigravity")
+            self.foot_note.setText("纯本地快照 · 切换将重启")
+            self.foot_widget.setVisible(True)
             self._render_accounts_tab()
         else:
-            self.foot_note.setText("同组模型共享 5h 与一周配额")
+            self.foot_widget.setVisible(False)
             self._render_quota_tab()
 
     def _render_quota_tab(self) -> None:
@@ -2089,7 +2288,7 @@ class ExpandedPopover(QWidget):
 
     def _resize_popover(self) -> None:
         prev_size = self.size()
-        host_w = POPOVER_VIS_WIDTH - 24
+        host_w = POPOVER_VIS_WIDTH - 20
         self.groups_host.setFixedWidth(host_w)
         self.groups_layout.invalidate()
         self.groups_layout.activate()
@@ -2138,72 +2337,89 @@ class ExpandedPopover(QWidget):
 
     def _build_group_card(self, g: dict, mode: str) -> QFrame:
         pal = PALETTES[self._theme]
-        is_cur_group = bool(g.get("isCurrentGroup"))
+        is_codex = g.get("externalSource") == "codex" or "codex" in str(g.get("id") or "").lower()
+        accent_dot = pal["green"] if is_codex else pal["accent"]
+
         card = QFrame()
         card.setObjectName("groupCard")
-        border_col = pal["accent"] if is_cur_group else pal["border"]
         card.setStyleSheet(
-            f"#groupCard {{ background: {pal['card_bg']}; border: 1px solid {border_col}; border-radius: 9px; }}"
+            f"#groupCard {{ background: {pal['card_alt']}; border: 1px solid {pal['border']}; border-radius: 8px; }}"
         )
+        if is_codex and g.get("recordedAt"):
+            card.setToolTip(f"OpenAI Codex 配额 · {fmt_relative_updated(g.get('recordedAt'))}（来自最近一次 Codex 会话）")
         lay = QVBoxLayout(card)
-        lay.setContentsMargins(9, 8, 9, 8)
-        lay.setSpacing(6)
+        lay.setContentsMargins(8, 6, 8, 7)
+        lay.setSpacing(5)
 
-        # Group header
+        # Compact single-line header: dot + group name + subtle active model label
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
-        top.setSpacing(6)
-        g_name = QLabel(g.get("displayName") or "Model Group")
-        g_name.setStyleSheet(f"color: {pal['fg']}; font-size: 12px; font-weight: 600;")
+        top.setSpacing(5)
+
+        dot = QLabel()
+        dot.setFixedSize(6, 6)
+        dot.setStyleSheet(f"background: {accent_dot}; border-radius: 3px;")
+        top.addWidget(dot)
+
+        raw_name = g.get("displayName") or "Model Group"
+        short_group_name = "Gemini" if "gemini" in raw_name.lower() else raw_name
+        g_name = QLabel(short_group_name)
+        g_name.setStyleSheet(f"color: {pal['fg']}; font-size: 10.5px; font-weight: 600;")
         top.addWidget(g_name)
-        if is_cur_group:
-            top.addWidget(make_pill_label("当前", pal["accent_soft"], pal["accent"], bold=True))
         top.addStretch(1)
-        cnt = QLabel(f"{g.get('modelCount', 0)} 模型")
-        cnt.setStyleSheet(f"color: {pal['muted']}; font-size: 11px;")
-        top.addWidget(cnt)
+
+        # Pick single concise active/primary model label
+        sub_model = ""
+        families = g.get("families") or []
+        for fam in families:
+            if fam.get("hasCurrent"):
+                cur_var = next((v for v in (fam.get("variants") or []) if v.get("isCurrent")), None)
+                sn = short_family_chip_name(fam.get("name") or "")
+                sub_model = f"{sn} ({cur_var['tierLabel']})" if (cur_var and cur_var.get("tierLabel")) else sn
+                break
+        if not sub_model and families:
+            sub_model = short_family_chip_name(families[0].get("name") or "")
+
+        if sub_model:
+            sub_lbl = QLabel(sub_model)
+            sub_lbl.setStyleSheet(f"color: {pal['muted']}; font-size: 9px;")
+            top.addWidget(sub_lbl)
+
+        pod_key = "codex" if is_codex else "antigravity"
+        is_pod_pinned = pod_key in self._pinned_pods
+        pin_pod_btn = QPushButton("")
+        pin_pod_btn.setFixedSize(18, 18)
+        pin_pod_btn.setIconSize(QSize(11, 11))
+        pin_pod_btn.setIcon(
+            _make_mini_icon("pin", accent_dot if is_pod_pinned else pal["muted"], filled=is_pod_pinned, size=11)
+        )
+        pin_pod_btn.setCursor(Qt.PointingHandCursor)
+        if is_pod_pinned and len(self._pinned_pods) <= 1:
+            pin_pod_btn.setToolTip("已固定到胶囊（至少保留 1 个显示项）")
+        elif is_pod_pinned:
+            pin_pod_btn.setToolTip("已固定到胶囊（点击取消固定）")
+        else:
+            pin_pod_btn.setToolTip("未在胶囊显示（点击固定到胶囊）")
+
+        pin_pod_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; border-radius: 4px; padding: 0px; }}"
+            f"QPushButton:hover {{ background: {pal['hover']}; }}"
+        )
+        pin_pod_btn.clicked.connect(lambda _checked=False, k=pod_key: self.pod_pin_toggled.emit(k))
+        top.addWidget(pin_pod_btn)
         lay.addLayout(top)
 
-        # 2-column meters grid (5h | 1周)
+        # 2-column compact meters grid (5h | 周)
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(3)
+        grid.setVerticalSpacing(2)
 
-        grid.addWidget(self._build_bucket_cell("5h", g.get("fiveHour"), mode, "5h: 仅周限额"), 0, 0)
-        grid.addWidget(self._build_bucket_cell("1周", g.get("weekly"), mode, "暂无周限额"), 0, 1)
+        grid.addWidget(self._build_bucket_cell("5h", g.get("fiveHour"), mode, "无 5h 限额"), 0, 0)
+        grid.addWidget(self._build_bucket_cell("周", g.get("weekly"), mode, "无周限额"), 0, 1)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         lay.addLayout(grid)
-
-        # Model family chips
-        families = g.get("families") or []
-        if families:
-            chips_host = QWidget()
-            chips_host.setStyleSheet("background: transparent;")
-            flow = FlowLayout(chips_host, margin=0, h_spacing=4, v_spacing=4)
-            for fam in families:
-                fam_name = fam.get("name") or ""
-                short_name = short_family_chip_name(fam_name)
-                variants = fam.get("variants") or []
-                variant_tiers = [v.get("tierLabel") for v in variants if v.get("tierLabel")]
-                cur_var = next((v for v in variants if v.get("isCurrent")), None)
-                if cur_var and cur_var.get("tierLabel"):
-                    chip_text = f"{short_name} ({cur_var['tierLabel']})"
-                else:
-                    chip_text = short_name
-
-                tip = f"{fam_name}: {' / '.join(variant_tiers)}" if variant_tiers else fam_name
-                is_cur_fam = bool(fam.get("hasCurrent"))
-                chip = make_pill_label(
-                    chip_text,
-                    pal["accent"] if is_cur_fam else pal["card_alt"],
-                    pal["accent_fg"] if is_cur_fam else pal["muted"],
-                    bold=is_cur_fam,
-                    tooltip=tip,
-                )
-                flow.addWidget(chip)
-            lay.addWidget(chips_host)
 
         return card
 
@@ -2233,21 +2449,32 @@ class ExpandedPopover(QWidget):
 
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
+        row.setSpacing(3)
         l_lbl = QLabel(label)
-        l_lbl.setStyleSheet(f"color: {pal['muted']}; font-size: 11px;")
-        v_lbl = QLabel(fmt_pct(val))
-        v_lbl.setStyleSheet(f"color: {pal['fg']}; font-size: 11.5px; font-weight: 600;")
+        l_lbl.setStyleSheet(f"color: {pal['muted']}; font-size: 9.5px;")
+        v_lbl = QPushButton(fmt_pct(val))
+        v_lbl.setCursor(Qt.PointingHandCursor)
+        v_lbl.setFlat(True)
+        mode_hint = "已用视角（点击切换为剩余视角）" if mode == "used" else "剩余视角（点击切换为已用视角）"
+        tip_reset = fmt_full_reset_time(reset_ms)
+        v_lbl.setToolTip(f"{mode_hint}\n{tip_reset}" if tip_reset else mode_hint)
+        v_lbl.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; padding: 0px; "
+            f"color: {pal['fg']}; font-size: 10px; font-weight: 600; }}"
+            f"QPushButton:hover {{ color: {pal['accent']}; }}"
+        )
+        v_lbl.clicked.connect(self.mode_toggled.emit)
         row.addWidget(l_lbl)
         row.addStretch(1)
         row.addWidget(v_lbl)
         if cd:
             c_lbl = QLabel(cd)
-            c_lbl.setStyleSheet(f"color: {pal['muted']}; font-size: 10.5px;")
+            c_lbl.setStyleSheet(f"color: {pal['muted']}; font-size: 9px;")
             row.addWidget(c_lbl)
         lay.addLayout(row)
 
         bar = QuotaProgressBar()
+        bar.setFixedHeight(4)
         bar.set_state(val, pal["track"], pal[tone_color_key(used)])
         lay.addWidget(bar)
 
@@ -2308,6 +2535,7 @@ class QuotaWidgetController(QObject):
         self.accounts_data: dict | None = None
         self.error_msg: str | None = None
         self.expanded = False
+        self.popover_pinned = False
         self.manual_hidden = False
         self._popover_raised_by_user = False
         self._is_sidecar = bool(os.environ.get("ANTIGRAVITY_LS_ADDRESS"))
@@ -2324,14 +2552,29 @@ class QuotaWidgetController(QObject):
 
         self.mini_card.toggled_expand.connect(self.toggle_expand)
         self.mini_card.toggled_dock.connect(self.toggle_dock_mode)
+        self.mini_card.drag_started.connect(self._on_mini_drag_started)
         self.mini_card.moved_while_dragging.connect(self._on_mini_drag_moved)
         self.mini_card.drag_finished.connect(self._on_mini_drag_finished)
         self.mini_card.context_menu_requested.connect(self._show_context_menu)
+        self.mini_card.hover_entered.connect(self._on_mini_hover_enter)
+        self.mini_card.hover_left.connect(self._on_hover_leave)
 
         self.popover.closed_requested.connect(self.collapse)
         self.popover.mode_toggled.connect(self.toggle_display_mode)
         self.popover.refresh_requested.connect(self._refresh_all)
+        self.popover.pin_toggled.connect(self.toggle_popover_pin)
+        self.popover.pod_pin_toggled.connect(self._toggle_pod_pin)
+        self.popover.hover_entered.connect(self._on_popover_hover_enter)
+        self.popover.hover_left.connect(self._on_hover_leave)
         self.popover.tab_changed.connect(self._on_popover_tab_changed)
+
+        self._hover_open_timer = QTimer(self)
+        self._hover_open_timer.setSingleShot(True)
+        self._hover_open_timer.timeout.connect(self._on_hover_open_timeout)
+
+        self._hover_close_timer = QTimer(self)
+        self._hover_close_timer.setSingleShot(True)
+        self._hover_close_timer.timeout.connect(self._on_hover_close_timeout)
         self.popover.size_changed.connect(self._on_popover_size_changed)
         self.popover.capture_account_requested.connect(self._capture_current_account)
         self.popover.import_agy_switch_requested.connect(self._import_agy_switch)
@@ -2355,6 +2598,8 @@ class QuotaWidgetController(QObject):
             self.tray.setContextMenu(self._tray_menu)
             self.tray.show()
 
+        self.mini_card.set_pinned_pods(self.prefs.get("pinned_pods") or ["antigravity", "codex"])
+        self.popover.set_pinned_pods(self.prefs.get("pinned_pods") or ["antigravity", "codex"])
         self.apply_theme_and_render()
 
         self.poll_timer = QTimer(self)
@@ -2367,6 +2612,10 @@ class QuotaWidgetController(QObject):
 
         self.track_timer = QTimer(self)
         self.track_timer.timeout.connect(self._update_dock_position)
+
+        self.taskbar_timer = QTimer(self)
+        self.taskbar_timer.timeout.connect(self._keep_taskbar_topmost)
+        self._tb_keepalive_ticks = 0
 
         self.lifecycle_timer = QTimer(self)
         self.lifecycle_timer.timeout.connect(self._check_app_lifecycle)
@@ -2393,6 +2642,11 @@ class QuotaWidgetController(QObject):
             self._place_float_initial()
             self.mini_card.show()
             self.tracker.set_topmost(int(self.mini_card.winId()), True)
+        elif self.prefs["dock"] == "taskbar":
+            self._place_taskbar()
+            self.mini_card.show()
+            self.tracker.set_topmost(int(self.mini_card.winId()), True)
+            self.taskbar_timer.start(600)
         else:
             self.track_timer.start(TRACK_MS)
             self._update_dock_position()
@@ -2583,26 +2837,101 @@ class QuotaWidgetController(QObject):
             return
         self._render_passive_update()
 
+    def _is_cursor_over_widgets(self) -> bool:
+        pos = QCursor.pos()
+        if self.mini_card.isVisible() and self.mini_card.geometry().adjusted(-6, -6, 6, 6).contains(pos):
+            return True
+        if self.popover.isVisible() and self.popover.geometry().adjusted(-6, -6, 6, 6).contains(pos):
+            return True
+        return False
+
+    def _on_mini_hover_enter(self) -> None:
+        self._hover_close_timer.stop()
+        if not self.expanded:
+            self._hover_open_timer.start(150)
+
+    def _on_popover_hover_enter(self) -> None:
+        self._hover_close_timer.stop()
+        self._hover_open_timer.stop()
+
+    def _on_hover_leave(self) -> None:
+        self._hover_open_timer.stop()
+        if self.expanded and not self.popover_pinned:
+            self._hover_close_timer.start(240)
+
+    def _on_hover_open_timeout(self) -> None:
+        if not self.expanded and self.mini_card.isVisible() and self.mini_card.geometry().contains(QCursor.pos()):
+            self.expand(via_hover=True)
+
+    def _on_hover_close_timeout(self) -> None:
+        if not self.expanded or self.popover_pinned:
+            return
+        if self._ctx_menu.isVisible() or self.popover.has_active_account_interaction():
+            return
+        if self._is_cursor_over_widgets():
+            return
+        self.collapse()
+
+    def toggle_popover_pin(self) -> None:
+        self.popover_pinned = not self.popover_pinned
+        self.popover.set_pinned(self.popover_pinned)
+        if self.popover_pinned:
+            self._hover_close_timer.stop()
+        elif self.expanded and not self._is_cursor_over_widgets():
+            self._hover_close_timer.start(240)
+
+    def _toggle_pod_pin(self, pod_key: str) -> None:
+        pods = list(self.prefs.get("pinned_pods") or ["antigravity", "codex"])
+        if pod_key in pods:
+            if len(pods) <= 1:
+                return
+            pods.remove(pod_key)
+        else:
+            # Keep consistent order: antigravity left, codex right
+            pods.append(pod_key)
+            pods = [k for k in ("antigravity", "codex") if k in pods]
+        self.prefs["pinned_pods"] = pods
+        save_prefs(self.prefs)
+        self.mini_card.set_pinned_pods(pods)
+        self.popover.set_pinned_pods(pods)
+        if self.prefs["dock"] == "taskbar":
+            self._place_taskbar()
+        if self.expanded and self.popover.isVisible():
+            self._position_popover()
+
+    def expand(self, via_hover: bool = False) -> None:
+        if self.expanded:
+            return
+        self._hover_open_timer.stop()
+        self._hover_close_timer.stop()
+        self.expanded = True
+        self._popover_raised_by_user = not via_hover
+        self.popover.set_pinned(self.popover_pinned)
+        self.apply_theme_and_render()
+        self._position_popover()
+        self.popover.show()
+        if self.prefs["dock"] in ("float", "taskbar"):
+            self.tracker.set_topmost(int(self.mini_card.winId()), True)
+            self.tracker.set_topmost(int(self.popover.winId()), True)
+            self.popover.raise_()
+        else:
+            self._update_dock_position()
+            self.popover.raise_()
+            if not via_hover:
+                self.popover.activateWindow()
+
     def toggle_expand(self) -> None:
         if self.expanded:
             self.collapse()
         else:
-            self.expanded = True
-            self._popover_raised_by_user = True
-            self.apply_theme_and_render()
-            self._position_popover()
-            self.popover.show()
-            if self.prefs["dock"] == "float":
-                self.tracker.set_topmost(int(self.mini_card.winId()), True)
-                self.tracker.set_topmost(int(self.popover.winId()), True)
-                self.popover.raise_()
-            else:
-                self._update_dock_position()
-                self.popover.raise_()
-                self.popover.activateWindow()
+            self.expand(via_hover=False)
 
     def collapse(self) -> None:
+        self._hover_open_timer.stop()
+        self._hover_close_timer.stop()
         self.expanded = False
+        self.popover_pinned = False
+        self.popover.set_pinned(False)
         self._popover_raised_by_user = False
         self.popover.hide()
         self.apply_theme_and_render()
@@ -2630,6 +2959,7 @@ class QuotaWidgetController(QObject):
         self.manual_hidden = False
         if dock == "float":
             self.track_timer.stop()
+            self.taskbar_timer.stop()
             self.apply_theme_and_render()
             self._place_float_initial()
             self.mini_card.show()
@@ -2640,7 +2970,21 @@ class QuotaWidgetController(QObject):
                 self.popover.show()
                 self.tracker.set_topmost(int(self.popover.winId()), True)
                 self.popover.raise_()
+        elif dock == "taskbar":
+            self.track_timer.stop()
+            self.apply_theme_and_render()
+            self._place_taskbar()
+            self.mini_card.show()
+            self.tracker.set_topmost(int(self.mini_card.winId()), True)
+            self.mini_card.raise_()
+            self.taskbar_timer.start(600)
+            if self.expanded:
+                self._position_popover()
+                self.popover.show()
+                self.tracker.set_topmost(int(self.popover.winId()), True)
+                self.popover.raise_()
         else:
+            self.taskbar_timer.stop()
             self.tracker.set_topmost(int(self.mini_card.winId()), False)
             self.tracker.set_topmost(int(self.popover.winId()), False)
             self.apply_theme_and_render()
@@ -2694,12 +3038,157 @@ class QuotaWidgetController(QObject):
         if self.expanded and self.popover.isVisible():
             self._position_popover()
 
+    def _get_taskbar_geometry(self) -> tuple[QRect, int]:
+        """Return (taskbar_rect_logical, safe_right_logical) avoiding tray & third-party taskbar widgets."""
+        screen = QApplication.primaryScreen()
+        geo = screen.geometry() if screen else QRect(0, 0, 1920, 1080)
+        avail = screen.availableGeometry() if screen else QRect(0, 0, 1920, 1044)
+        dpr = float(screen.devicePixelRatio()) if screen else 1.0
+
+        # Always derive vertical bounds from Qt logical coordinates to eliminate DPI mismatch.
+        tb_top = avail.bottom() + 1
+        tb_h = max(30, geo.bottom() - avail.bottom())
+        tb_rect = QRect(geo.left(), tb_top, geo.width(), tb_h)
+        safe_right = geo.right() - 280
+
+        own_hwnds = set()
+        try:
+            own_hwnds.add(int(self.mini_card.winId()))
+            own_hwnds.add(int(self.popover.winId()))
+        except Exception:
+            pass
+
+        try:
+            u32 = ctypes.windll.user32
+            u32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+            u32.FindWindowW.restype = wintypes.HWND
+            u32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+            u32.FindWindowExW.restype = wintypes.HWND
+            u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+            u32.GetWindowRect.restype = wintypes.BOOL
+            u32.IsWindowVisible.argtypes = [wintypes.HWND]
+            u32.IsWindowVisible.restype = wintypes.BOOL
+
+            tb_hwnd = u32.FindWindowW("Shell_TrayWnd", None)
+            if tb_hwnd:
+                tray_hwnd = u32.FindWindowExW(tb_hwnd, None, "TrayNotifyWnd", None)
+                if tray_hwnd:
+                    tr = wintypes.RECT()
+                    if u32.GetWindowRect(tray_hwnd, ctypes.byref(tr)) and tr.left > 0:
+                        safe_right = min(safe_right, int(round(tr.left / dpr)) - 8)
+
+                # Scan both taskbar child widgets and top-level floating taskbar orbs (e.g., PC Manager memory ball)
+                tb_top_phys = int(round(tb_top * dpr))
+                tb_bot_phys = int(round((geo.bottom() + 1) * dpr))
+                mid_x_logical = geo.left() + int(geo.width() * 0.52)
+
+                EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+                def _check_obstacle(hwnd, _lp):
+                    if int(hwnd) in own_hwnds or int(hwnd) == int(tb_hwnd):
+                        return True
+                    if not u32.IsWindowVisible(hwnd):
+                        return True
+                    wr = wintypes.RECT()
+                    if not u32.GetWindowRect(hwnd, ctypes.byref(wr)):
+                        return True
+                    w_log = (wr.right - wr.left) / dpr
+                    h_log = (wr.bottom - wr.top) / dpr
+                    if w_log <= 6 or h_log <= 6 or w_log > 420 or h_log > tb_h + 26:
+                        return True
+                    # Vertically overlaps the taskbar band
+                    if wr.bottom >= tb_top_phys + 4 and wr.top <= tb_bot_phys:
+                        left_log = int(round(wr.left / dpr))
+                        if mid_x_logical <= left_log <= geo.right():
+                            nonlocal safe_right
+                            safe_right = min(safe_right, left_log - 8)
+                    return True
+
+                cb = EnumProc(_check_obstacle)
+                u32.EnumChildWindows(tb_hwnd, cb, 0)
+                u32.EnumWindows(cb, 0)
+        except Exception:
+            pass
+
+        return tb_rect, safe_right
+
+    def _place_taskbar(self, preferred_x: int | None = None) -> None:
+        tb_rect, safe_right = self._get_taskbar_geometry()
+        self.mini_card.set_taskbar_height(tb_rect.height())
+        vis_w, vis_h = self.mini_card.visible_size()
+
+        if preferred_x is not None:
+            vis_x = preferred_x + SHADOW_MARGIN
+        elif self.prefs.get("taskbar_x") is not None:
+            vis_x = int(self.prefs["taskbar_x"])
+        else:
+            vis_x = safe_right - vis_w
+
+        min_x = tb_rect.left() + 8
+        max_x = max(min_x, safe_right - vis_w)
+        vis_x = max(min_x, min(vis_x, max_x))
+
+        # Center the full MINI_VIS_HEIGHT box vertically on the taskbar so the inner _tb_height sits cleanly inside.
+        vis_y = tb_rect.top() + (tb_rect.height() - vis_h) // 2
+        self.mini_card.move(vis_x - SHADOW_MARGIN, vis_y - SHADOW_MARGIN)
+        log_event(f"taskbar_place tb=({tb_rect.left()},{tb_rect.top()},{tb_rect.width()}x{tb_rect.height()}) safe_right={safe_right} pos=({vis_x},{vis_y})")
+
+    def _on_mini_drag_started(self) -> None:
+        self._hover_open_timer.stop()
+        self._hover_close_timer.stop()
+        if self.expanded and not self.popover_pinned:
+            self.collapse()
+
+    def _keep_taskbar_topmost(self) -> None:
+        if self.prefs["dock"] != "taskbar" or self.manual_hidden or self.mini_card._dragging:
+            return
+        if not self.mini_card.isVisible():
+            return
+        self.tracker.set_topmost(int(self.mini_card.winId()), True)
+        if self.expanded and self.popover.isVisible():
+            self.tracker.set_topmost(int(self.popover.winId()), True)
+
+        # Every ~3s, re-check right taskbar boundary to yield smoothly if tray icons expand
+        self._tb_keepalive_ticks += 1
+        if self._tb_keepalive_ticks >= 5:
+            self._tb_keepalive_ticks = 0
+            tb_rect, safe_right = self._get_taskbar_geometry()
+            vis_w, vis_h = self.mini_card.visible_size()
+            cur_vis_x = self.mini_card.x() + SHADOW_MARGIN
+            max_x = max(tb_rect.left() + 8, safe_right - vis_w)
+            if cur_vis_x > max_x:
+                vis_y = tb_rect.top() + (tb_rect.height() - vis_h) // 2
+                self.mini_card.move(max_x - SHADOW_MARGIN, vis_y - SHADOW_MARGIN)
+                if self.expanded and self.popover.isVisible():
+                    self._position_popover()
+
     def _on_mini_drag_finished(self, x: int, y: int) -> None:
-        if self.prefs["dock"] == "float":
+        if self.prefs["dock"] not in ("float", "taskbar"):
+            return
+        tb_rect, _tray_left = self._get_taskbar_geometry()
+        vis_w, vis_h = self.mini_card.visible_size()
+        center_y = y + SHADOW_MARGIN + vis_h // 2
+
+        if center_y >= tb_rect.top() - 4:
+            # Dropped into taskbar -> seamlessly merge into taskbar
+            self.prefs["dock"] = "taskbar"
+            self._place_taskbar(preferred_x=x)
+            self.prefs["taskbar_x"] = self.mini_card.x() + SHADOW_MARGIN
+            save_prefs(self.prefs)
+            self.apply_theme_and_render()
+            self.tracker.set_topmost(int(self.mini_card.winId()), True)
+            self.taskbar_timer.start(600)
+        else:
+            # Lifted out of taskbar -> restore floating capsule
+            self.prefs["dock"] = "float"
             self.prefs["float_pos"] = [x, y]
             save_prefs(self.prefs)
-            if self.expanded and self.popover.isVisible():
-                self._position_popover()
+            self.taskbar_timer.stop()
+            self.apply_theme_and_render()
+            self.tracker.set_topmost(int(self.mini_card.winId()), True)
+
+        if self.expanded and self.popover.isVisible():
+            self._position_popover()
 
     def _position_popover(self) -> None:
         mini_geo = self.mini_card.geometry()
@@ -2710,6 +3199,15 @@ class QuotaWidgetController(QObject):
         mini_vis_left = mini_geo.left() + SHADOW_MARGIN
         mini_vis_right = mini_geo.right() - SHADOW_MARGIN
         mini_vis_bottom = mini_geo.bottom() - SHADOW_MARGIN
+
+        if self.prefs["dock"] == "taskbar":
+            mini_vis_w, _ = self.mini_card.visible_size()
+            pop_vis_left = mini_vis_left + (mini_vis_w - pop_w) // 2
+            pop_vis_left = max(avail.left() + 6, min(pop_vis_left, avail.right() - pop_w - 6))
+            pop_vis_top = avail.bottom() - pop_h - 6
+            pop_vis_top = max(avail.top(), pop_vis_top)
+            self.popover.move(pop_vis_left - SHADOW_MARGIN, pop_vis_top - SHADOW_MARGIN)
+            return
 
         pop_vis_left = mini_vis_right + 8
         if pop_vis_left + pop_w > avail.right():
@@ -2862,100 +3360,56 @@ class QuotaWidgetController(QObject):
         head = f"{live_email} · {label}" if live_email else label
         self.tray.setToolTip(f"{head}\n{fh_txt} | {wk_txt}".strip(" |"))
 
+    def _style_menu(self, menu: QMenu) -> None:
+        pal = PALETTES[self._effective_theme()]
+        menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        menu.setAttribute(Qt.WA_TranslucentBackground, True)
+        menu.setStyleSheet(
+            f"QMenu {{ background: {pal['card_bg']}; color: {pal['fg']}; "
+            f"border: 1px solid {pal['border']}; border-radius: 10px; padding: 5px; font-size: 11px; }}"
+            f"QMenu::item {{ padding: 5px 18px 5px 12px; border-radius: 6px; margin: 1px 0px; }}"
+            f"QMenu::item:selected {{ background: {pal['accent_soft']}; color: {pal['fg']}; }}"
+            f"QMenu::item:disabled {{ color: {pal['muted']}; }}"
+            f"QMenu::separator {{ height: 1px; background: {pal['border']}; margin: 4px 8px; }}"
+            f"QMenu::indicator {{ width: 12px; height: 12px; margin-left: 4px; }}"
+        )
+
     def _populate_menu(self, menu: QMenu) -> QMenu:
         menu.clear()
+        self._style_menu(menu)
         refs: list[QObject] = []
 
-        toggle_vis = QAction("隐藏浮窗" if self.mini_card.isVisible() else "显示浮窗", menu)
-        toggle_vis.triggered.connect(self.toggle_visible)
-        menu.addAction(toggle_vis)
-        refs.append(toggle_vis)
-
-        toggle_exp = QAction("收起全部模型" if self.expanded else "展开全部模型", menu)
-        toggle_exp.triggered.connect(self.toggle_expand)
-        menu.addAction(toggle_exp)
-        refs.append(toggle_exp)
-
-        acct_menu = menu.addMenu("账号切换")
-        refs.append(acct_menu)
-        acc_data = self.accounts_data or {}
-        live_email = (
-            ((acc_data.get("liveAccount") or {}).get("email"))
-            or (((self.payload or {}).get("account") or {}).get("email"))
-            or ""
-        )
-        hdr_act = QAction(f"当前: {live_email or '未检测到在线账号'}", acct_menu)
-        hdr_act.setEnabled(False)
-        acct_menu.addAction(hdr_act)
-        refs.append(hdr_act)
-
-        save_act = QAction("保存当前账号快照", acct_menu)
-        save_act.triggered.connect(self._capture_current_account)
-        acct_menu.addAction(save_act)
-        refs.append(save_act)
-
-        agy_cnt = int(acc_data.get("agySwitchCount") or 0)
-        imp_act = QAction(f"从 agy-switch 导入 ({agy_cnt})" if agy_cnt > 0 else "从 agy-switch 导入", acct_menu)
-        imp_act.triggered.connect(self._import_agy_switch)
-        acct_menu.addAction(imp_act)
-        refs.append(imp_act)
-
-        accounts = acc_data.get("accounts") or []
-        switch_locked = bool(acc_data.get("switchLocked"))
-        if accounts:
-            acct_menu.addSeparator()
-            for acc in accounts:
-                title = acc.get("remark") or acc.get("email") or "未知账号"
-                if acc.get("tier"):
-                    title = f"{title} [{acc['tier']}]"
-                if acc.get("isCurrent"):
-                    title = f"{title} (当前)"
-                act = QAction(title, acct_menu, checkable=True)
-                act.setChecked(bool(acc.get("isCurrent")))
-                if acc.get("isCurrent") or not acc.get("hasCredential") or switch_locked:
-                    act.setEnabled(False)
-                else:
-                    act.triggered.connect(lambda _checked=False, a=dict(acc): self._confirm_and_switch_from_menu(a))
-                acct_menu.addAction(act)
-                refs.append(act)
-
-        menu.addSeparator()
-
+        # 1. Position mode (compact 3-way)
         dock_group = QActionGroup(menu)
         refs.append(dock_group)
-        act_docked = QAction("吸附到 Antigravity 左下角", menu, checkable=True)
-        act_docked.setChecked(self.prefs["dock"] == "docked")
-        act_docked.triggered.connect(lambda: self.set_dock_mode("docked"))
-        dock_group.addAction(act_docked)
-        menu.addAction(act_docked)
-        refs.append(act_docked)
-
-        act_float = QAction("自由悬浮置顶", menu, checkable=True)
-        act_float.setChecked(self.prefs["dock"] == "float")
-        act_float.triggered.connect(lambda: self.set_dock_mode("float"))
-        dock_group.addAction(act_float)
-        menu.addAction(act_float)
-        refs.append(act_float)
+        for label, key in [
+            ("合并到任务栏", "taskbar"),
+            ("桌面自由悬浮", "float"),
+            ("吸附 Antigravity 左下角", "docked"),
+        ]:
+            act = QAction(label, menu, checkable=True)
+            act.setChecked(self.prefs["dock"] == key)
+            act.triggered.connect(lambda _checked=False, k=key: self.set_dock_mode(k))
+            dock_group.addAction(act)
+            menu.addAction(act)
+            refs.append(act)
 
         menu.addSeparator()
 
-        mode_group = QActionGroup(menu)
-        refs.append(mode_group)
-        act_used = QAction("已用视角", menu, checkable=True)
-        act_used.setChecked(self.prefs["mode"] == "used")
-        act_used.triggered.connect(lambda: self.set_display_mode("used"))
-        mode_group.addAction(act_used)
-        menu.addAction(act_used)
-        refs.append(act_used)
+        # 2. One-click display mode toggle
+        next_mode_label = "切换为剩余视角" if self.prefs["mode"] == "used" else "切换为已用视角"
+        act_mode = QAction(next_mode_label, menu)
+        act_mode.triggered.connect(self.toggle_display_mode)
+        menu.addAction(act_mode)
+        refs.append(act_mode)
 
-        act_rem = QAction("剩余视角", menu, checkable=True)
-        act_rem.setChecked(self.prefs["mode"] == "remaining")
-        act_rem.triggered.connect(lambda: self.set_display_mode("remaining"))
-        mode_group.addAction(act_rem)
-        menu.addAction(act_rem)
-        refs.append(act_rem)
+        # 3. Preferences submenu (low-frequency settings grouped cleanly)
+        pref_menu = menu.addMenu("偏好设置")
+        self._style_menu(pref_menu)
+        refs.append(pref_menu)
 
-        theme_menu = menu.addMenu("外观主题")
+        theme_menu = pref_menu.addMenu("外观主题")
+        self._style_menu(theme_menu)
         refs.append(theme_menu)
         theme_group = QActionGroup(theme_menu)
         refs.append(theme_group)
@@ -2967,14 +3421,20 @@ class QuotaWidgetController(QObject):
             theme_menu.addAction(act)
             refs.append(act)
 
-        menu.addSeparator()
-
-        act_auto_exit = QAction("随 Antigravity 关闭自动退出", menu, checkable=True)
+        act_auto_exit = QAction("随 Antigravity 关闭退出", pref_menu, checkable=True)
         act_auto_exit.setChecked(bool(self.prefs.get("auto_exit_with_app", True)))
         act_auto_exit.triggered.connect(self.toggle_auto_exit)
-        menu.addAction(act_auto_exit)
+        pref_menu.addAction(act_auto_exit)
         refs.append(act_auto_exit)
 
+        toggle_vis = QAction("隐藏浮窗" if self.mini_card.isVisible() else "显示浮窗", pref_menu)
+        toggle_vis.triggered.connect(self.toggle_visible)
+        pref_menu.addAction(toggle_vis)
+        refs.append(toggle_vis)
+
+        menu.addSeparator()
+
+        # 4. Refresh & Quit
         act_refresh = QAction("立即刷新", menu)
         act_refresh.triggered.connect(self._refresh_all)
         menu.addAction(act_refresh)
@@ -2996,6 +3456,9 @@ class QuotaWidgetController(QObject):
         return self._populate_menu(menu)
 
     def _show_context_menu(self, global_pos: QPoint) -> None:
+        self._hover_open_timer.stop()
+        if self.expanded and not self.popover_pinned:
+            self.collapse()
         self._populate_menu(self._ctx_menu)
         self._ctx_menu.exec_(global_pos)
 
@@ -3282,6 +3745,7 @@ def main() -> int:
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
+    app.setFont(QFont("Microsoft YaHei UI", 9))
     app.setQuitOnLastWindowClosed(False)
 
     controller = QuotaWidgetController(app, enable_tray=True)

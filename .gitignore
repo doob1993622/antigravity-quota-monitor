@@ -11,3 +11,5 @@ switch_status.json
 vault/
 credentials/
 *accounts*.json
+
+.venv/

@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { SidecarApp, Response } from 'sidecar_sdk';
 import { createAccountStore, resolveVaultDir } from './accounts_store.mjs';
 import { launchSwitchWorker } from './switch_worker.mjs';
+import { readCodexQuotaGroup } from './codex_quota.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ID_RE = /^[0-9a-f-]{8,}$/i;
@@ -573,7 +574,7 @@ function buildFamiliesForModels(models) {
   return families;
 }
 
-function buildQuotaPayload({ fetchedAt, quotaSummary, userStatus, stale, error }, appData, convId) {
+function buildQuotaPayload({ fetchedAt, quotaSummary, userStatus, stale, error }, appData, convId, force = false) {
   const modelData = userStatus?.cascadeModelConfigData || {};
   const allConfigs = Array.isArray(modelData.clientModelConfigs) ? modelData.clientModelConfigs : [];
   const activeConfigs = allConfigs.filter((c) => !c?.disabled);
@@ -713,6 +714,15 @@ function buildQuotaPayload({ fetchedAt, quotaSummary, userStatus, stale, error }
     };
   }
 
+  const visibleGroups = groups.filter(
+    (g) => !/claude\s+and\s+gpt/i.test(g.displayName || '') && g.id !== 'claude-and-gpt-models',
+  );
+
+  const codexGroup = readCodexQuotaGroup(Boolean(force));
+  if (codexGroup) {
+    visibleGroups.push(codexGroup);
+  }
+
   return {
     fetchedAt,
     stale: Boolean(stale),
@@ -722,7 +732,7 @@ function buildQuotaPayload({ fetchedAt, quotaSummary, userStatus, stale, error }
     tier: tierName || planName ? { id: userStatus?.userTier?.id || null, name: tierName, planName } : null,
     summaryDescription: quotaSummary?.description || '',
     current: currentPayload,
-    groups,
+    groups: visibleGroups,
     disabledModels,
   };
 }
@@ -754,7 +764,7 @@ async function getLiveContext(convIdOverride = '', force = false) {
     '';
   const appData = findAppDataDir();
   const sources = await fetchQuotaSources(force);
-  const quotaPayload = buildQuotaPayload(sources, appData, convId);
+  const quotaPayload = buildQuotaPayload(sources, appData, convId, force);
   return { appData, convId, sources, quotaPayload };
 }
 

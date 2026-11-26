@@ -107,7 +107,7 @@ export function summarizeQuotaForCache(quotaPayload) {
   return {
     fetchedAt: Number.isFinite(quotaPayload.fetchedAt) ? quotaPayload.fetchedAt : Date.now(),
     tier: quotaPayload.tier?.planName || quotaPayload.tier?.name || null,
-    groups: quotaPayload.groups.map((g) => ({
+    groups: quotaPayload.groups.filter((g) => !g?.externalSource).map((g) => ({
       id: g.id || '',
       displayName: g.displayName || '',
       isCurrentGroup: Boolean(g.isCurrentGroup),
