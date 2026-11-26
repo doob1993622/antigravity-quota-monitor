@@ -9,8 +9,8 @@
 > - **极矮横排双环胶囊（`128×32px` 任务栏融合 / `138×42px` 悬浮球）**：左环 Antigravity 拱形 A、右环 OpenAI 六瓣结，外环显示 5h 用量，右侧显示周用量与 5h 下次重置倒计时；**拖进任务栏自动融合避让托盘图标，往上拖出即可单拎悬浮**。
 > - **丝滑悬停交互**：鼠标悬停自动弹出精简双卡详情（不抢输入焦点），挪开自动隐藏；点顶栏图钉可常驻置顶，点卡片图钉可单独控制该模型是否在胶囊上显示，单击百分比可一键切换已用/剩余视角，配套暗黑圆角右键菜单。
 >
-> **朋友快速安装（Windows）**：
-> 1. `git clone https://git.code.tencent.com/DoobLiu/quota-monitor.git "$env:USERPROFILE\.gemini\config\plugins\quota-monitor"`（不想放 C 盘可克隆到其他盘后用目录联接映射）。
+> **快速安装（Windows）**：
+> 1. `agy plugin install https://github.com/doob1993622/antigravity-quota-monitor`（或 `git clone https://github.com/doob1993622/antigravity-quota-monitor.git "$env:USERPROFILE\.gemini\config\plugins\quota-monitor"`）。
 > 2. `pip install PyQt5`（用于启用桌面/任务栏胶囊浮窗），重启一次 Antigravity 即可自动生效。
 
 ---
