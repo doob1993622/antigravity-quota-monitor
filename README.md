@@ -2,7 +2,18 @@
 
 <img src="assets/logo.svg" width="84" height="84" alt="Antigravity Model Quota Monitor Logo" />
 
-# Antigravity Model Quota Monitor
+# Antigravity + Codex Model Quota Monitor（极简任务栏双环定制版）
+
+> **本仓库定制优化亮点**：
+> - **双平台配额同屏监控**：除 Google Antigravity（Gemini）配额外，新增本地 **OpenAI Codex** 配额读取（零 Token 消耗，自动识别 5h / 1 周窗口及过期归零），并隐藏了冗余的中间分组。
+> - **极矮横排双环胶囊（`128×32px` 任务栏融合 / `138×42px` 悬浮球）**：左环 Antigravity 拱形 A、右环 OpenAI 六瓣结，外环显示 5h 用量，右侧显示周用量与 5h 下次重置倒计时；**拖进任务栏自动融合避让托盘图标，往上拖出即可单拎悬浮**。
+> - **丝滑悬停交互**：鼠标悬停自动弹出精简双卡详情（不抢输入焦点），挪开自动隐藏；点顶栏图钉可常驻置顶，点卡片图钉可单独控制该模型是否在胶囊上显示，单击百分比可一键切换已用/剩余视角，配套暗黑圆角右键菜单。
+>
+> **朋友快速安装（Windows）**：
+> 1. `git clone https://git.code.tencent.com/DoobLiu/quota-monitor.git "$env:USERPROFILE\.gemini\config\plugins\quota-monitor"`（不想放 C 盘可克隆到其他盘后用目录联接映射）。
+> 2. `pip install PyQt5`（用于启用桌面/任务栏胶囊浮窗），重启一次 Antigravity 即可自动生效。
+
+---
 
 **为 Google Antigravity 2.0 打造的实时模型配额监控与多账号一键切换插件 · 零 Token 消耗**
 
