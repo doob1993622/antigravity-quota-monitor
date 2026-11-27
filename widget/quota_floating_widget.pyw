@@ -15,6 +15,7 @@ import ctypes.wintypes as wintypes
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -679,20 +680,24 @@ class Win32WindowTracker:
         self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         return int(pid.value)
 
-    def get_process_exe_name(self, pid: int) -> str:
+    def get_process_image_path(self, pid: int) -> str:
         if not pid:
             return ""
         handle = self.kernel32.OpenProcess(self.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             return ""
         try:
-            size = wintypes.DWORD(512)
-            buf = ctypes.create_unicode_buffer(512)
+            size = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(1024)
             if self.kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-                return Path(buf.value).stem.lower()
+                return buf.value.lower()
             return ""
         finally:
             self.kernel32.CloseHandle(handle)
+
+    def get_process_exe_name(self, pid: int) -> str:
+        img = self.get_process_image_path(pid)
+        return Path(img).stem.lower() if img else ""
 
     def get_window_title(self, hwnd: int) -> str:
         length = self.user32.GetWindowTextLengthW(hwnd)
@@ -791,6 +796,76 @@ class Win32WindowTracker:
         if fallback_matches:
             return fallback_matches[0]
         return 0
+
+    def find_codex_hwnd(self) -> int:
+        primary_matches: list[int] = []
+        fallback_matches: list[int] = []
+
+        def enum_cb(hwnd, _lparam):
+            if not self.user32.IsWindowVisible(hwnd):
+                return True
+            pid = self.get_pid(hwnd)
+            if pid == self.own_pid:
+                return True
+
+            iconic = self.is_iconic(hwnd)
+            if not iconic:
+                rect = self.get_window_rect(hwnd)
+                if not rect or (rect[2] - rect[0]) < 320 or (rect[3] - rect[1]) < 240:
+                    return True
+
+            img_path = self.get_process_image_path(pid)
+            exe = Path(img_path).stem.lower() if img_path else ""
+            title = self.get_window_title(hwnd)
+            if not title:
+                return True
+
+            if "openai.codex" in img_path or exe == "codex":
+                primary_matches.append(int(hwnd))
+            elif exe == "chatgpt" and "codex" in title.lower():
+                fallback_matches.append(int(hwnd))
+            return True
+
+        self.user32.EnumWindows(self.WNDENUMPROC(enum_cb), 0)
+        if primary_matches:
+            return primary_matches[0]
+        if fallback_matches:
+            return fallback_matches[0]
+        return 0
+
+    def focus_window(self, hwnd: int) -> bool:
+        if not hwnd:
+            return False
+        try:
+            SW_RESTORE = 9
+            SW_SHOW = 5
+            if self.is_iconic(hwnd):
+                self.user32.ShowWindow(hwnd, SW_RESTORE)
+            else:
+                self.user32.ShowWindow(hwnd, SW_SHOW)
+
+            fg_hwnd = self.get_foreground_hwnd()
+            cur_tid = self.kernel32.GetCurrentThreadId()
+            fg_tid = self.user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
+            tgt_tid = self.user32.GetWindowThreadProcessId(hwnd, None)
+
+            attached_fg = False
+            attached_tgt = False
+            try:
+                if fg_tid and fg_tid != cur_tid:
+                    attached_fg = bool(self.user32.AttachThreadInput(cur_tid, fg_tid, True))
+                if tgt_tid and tgt_tid != cur_tid and tgt_tid != fg_tid:
+                    attached_tgt = bool(self.user32.AttachThreadInput(cur_tid, tgt_tid, True))
+                self.user32.BringWindowToTop(hwnd)
+                self.user32.SetForegroundWindow(hwnd)
+            finally:
+                if attached_tgt:
+                    self.user32.AttachThreadInput(cur_tid, tgt_tid, False)
+                if attached_fg:
+                    self.user32.AttachThreadInput(cur_tid, fg_tid, False)
+            return True
+        except Exception:
+            return False
 
     def physical_to_logical(self, hwnd: int, phys_x: int, phys_y: int):
         screens = QApplication.screens()
@@ -1213,6 +1288,7 @@ class MiniQuotaCard(QWidget):
     drag_started = pyqtSignal()
     moved_while_dragging = pyqtSignal()
     drag_finished = pyqtSignal(int, int)
+    pod_clicked = pyqtSignal(str)
     context_menu_requested = pyqtSignal(QPoint)
     hover_entered = pyqtSignal()
     hover_left = pyqtSignal()
@@ -1569,7 +1645,13 @@ class MiniQuotaCard(QWidget):
             if was_drag:
                 self.drag_finished.emit(self.x(), self.y())
             else:
-                self.toggled_expand.emit()
+                pods = [p for p in ("antigravity", "codex") if p in self._pinned_pods] or ["antigravity"]
+                if len(pods) == 1:
+                    target = pods[0]
+                else:
+                    mid_x = SHADOW_MARGIN + self._calc_vis_width() / 2.0
+                    target = pods[0] if event.pos().x() < mid_x else pods[1]
+                self.pod_clicked.emit(target)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -2555,6 +2637,7 @@ class QuotaWidgetController(QObject):
         self.mini_card.drag_started.connect(self._on_mini_drag_started)
         self.mini_card.moved_while_dragging.connect(self._on_mini_drag_moved)
         self.mini_card.drag_finished.connect(self._on_mini_drag_finished)
+        self.mini_card.pod_clicked.connect(self._focus_or_launch_app)
         self.mini_card.context_menu_requested.connect(self._show_context_menu)
         self.mini_card.hover_entered.connect(self._on_mini_hover_enter)
         self.mini_card.hover_left.connect(self._on_hover_leave)
@@ -3132,6 +3215,53 @@ class QuotaWidgetController(QObject):
         vis_y = tb_rect.top() + (tb_rect.height() - vis_h) // 2
         self.mini_card.move(vis_x - SHADOW_MARGIN, vis_y - SHADOW_MARGIN)
         log_event(f"taskbar_place tb=({tb_rect.left()},{tb_rect.top()},{tb_rect.width()}x{tb_rect.height()}) safe_right={safe_right} pos=({vis_x},{vis_y})")
+
+    def _focus_or_launch_app(self, kind: str) -> None:
+        self._hover_open_timer.stop()
+        if self.expanded and not self.popover_pinned:
+            self.collapse()
+
+        if kind == "antigravity":
+            hwnd = self.tracker.find_antigravity_hwnd()
+            if hwnd and self.tracker.focus_window(hwnd):
+                return
+            local_app = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+            for cand in [
+                local_app / "Antigravity" / "Antigravity.exe",
+                local_app / "Programs" / "Antigravity" / "Antigravity.exe",
+            ]:
+                if cand.is_file():
+                    try:
+                        subprocess.Popen([str(cand)], close_fds=True)
+                    except Exception:
+                        pass
+                    return
+            return
+
+        if kind == "codex":
+            hwnd = self.tracker.find_codex_hwnd()
+            if hwnd and self.tracker.focus_window(hwnd):
+                return
+            # Try launching installed Codex Desktop (MSIX App or standalone executable)
+            local_app = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+            for cand in [
+                local_app / "Programs" / "OpenAI" / "Codex" / "Codex.exe",
+                local_app / "Programs" / "Codex" / "Codex.exe",
+            ]:
+                if cand.is_file():
+                    try:
+                        subprocess.Popen([str(cand)], close_fds=True)
+                    except Exception:
+                        pass
+                    return
+            try:
+                # MSIX / Microsoft Store Codex app launch via shell:AppsFolder
+                subprocess.Popen(
+                    ["explorer.exe", r"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App"],
+                    close_fds=True,
+                )
+            except Exception:
+                pass
 
     def _on_mini_drag_started(self) -> None:
         self._hover_open_timer.stop()
