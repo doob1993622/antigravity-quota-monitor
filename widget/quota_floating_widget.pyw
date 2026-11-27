@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wintypes
 import json
+import math
 import os
 import re
 import subprocess
@@ -1312,6 +1313,12 @@ class MiniQuotaCard(QWidget):
         self._drag_moved = False
         self._press_global = QPoint()
         self._press_win = QPoint()
+        self._pressed_pod: str | None = None
+        self._pod_scale = {"antigravity": 1.0, "codex": 1.0}
+        self._bounce_anim: dict[str, tuple[float, float]] = {}
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(16)
+        self._anim_timer.timeout.connect(self._tick_pod_anim)
 
         self._left_data = {
             "kind": "antigravity",
@@ -1442,6 +1449,40 @@ class MiniQuotaCard(QWidget):
         self._tb_height = max(26, min(32, int(tb_h) - 4))
         self.update()
 
+    def _hit_test_pod(self, local_pos: QPoint) -> str:
+        pods = [p for p in ("antigravity", "codex") if p in self._pinned_pods] or ["antigravity"]
+        if len(pods) == 1:
+            return pods[0]
+        mid_x = SHADOW_MARGIN + self._calc_vis_width() / 2.0
+        return pods[0] if local_pos.x() < mid_x else pods[1]
+
+    def _start_pod_bounce(self, pod_key: str) -> None:
+        self._bounce_anim[pod_key] = (time.monotonic(), self._pod_scale.get(pod_key, 0.88))
+        if not self._anim_timer.isActive():
+            self._anim_timer.start()
+
+    def _tick_pod_anim(self) -> None:
+        now = time.monotonic()
+        done: list[str] = []
+        changed = False
+        for key, (t0, s0) in list(self._bounce_anim.items()):
+            dt = now - t0
+            if dt >= 0.26:
+                self._pod_scale[key] = 1.0
+                done.append(key)
+                changed = True
+            else:
+                # Crisp underdamped spring bounce: 0.88 -> ~1.035 -> 1.0
+                val = 1.0 + (s0 - 1.0) * math.exp(-13.5 * dt) * math.cos(24.0 * dt)
+                self._pod_scale[key] = val
+                changed = True
+        for key in done:
+            self._bounce_anim.pop(key, None)
+        if not self._bounce_anim:
+            self._anim_timer.stop()
+        if changed:
+            self.update()
+
     def _paint_pod(
         self,
         p: QPainter,
@@ -1452,6 +1493,16 @@ class MiniQuotaCard(QWidget):
         is_dark: bool,
         compact_tb: bool = False,
     ) -> None:
+        kind = data.get("kind") or "antigravity"
+        sc = float(self._pod_scale.get(kind, 1.0))
+        pod_w = 61.0 if compact_tb else 66.0
+        p.save()
+        if abs(sc - 1.0) > 0.001:
+            pivot_x = pod_left + pod_w * 0.48
+            p.translate(pivot_x, cy_mid)
+            p.scale(sc, sc)
+            p.translate(-pivot_x, -cy_mid)
+
         rad = 10.0 if compact_tb else 11.5
         ring_cx = pod_left + (14.5 if compact_tb else 16.5)
         ring_rect = QRectF(ring_cx - rad, cy_mid - rad, rad * 2, rad * 2)
@@ -1504,6 +1555,7 @@ class MiniQuotaCard(QWidget):
             Qt.AlignVCenter | Qt.AlignLeft,
             rst_txt,
         )
+        p.restore()
 
     def paintEvent(self, _event):
         in_taskbar = self._dock_mode == "taskbar" and not self._drag_moved
@@ -1613,6 +1665,11 @@ class MiniQuotaCard(QWidget):
             self._drag_moved = False
             self._press_global = event.globalPos()
             self._press_win = self.pos()
+            pod = self._hit_test_pod(event.pos())
+            self._pressed_pod = pod
+            self._bounce_anim.pop(pod, None)
+            self._pod_scale[pod] = 0.88
+            self.update()
             event.accept()
             return
         if event.button() == Qt.RightButton:
@@ -1627,6 +1684,9 @@ class MiniQuotaCard(QWidget):
             if self._dock_mode in ("float", "taskbar") and (abs(delta.x()) >= 5 or abs(delta.y()) >= 5):
                 if not self._drag_moved:
                     self._drag_moved = True
+                    if self._pressed_pod:
+                        self._start_pod_bounce(self._pressed_pod)
+                        self._pressed_pod = None
                     self._sync_fixed_size()
                     self.drag_started.emit()
                     self.update()
@@ -1640,17 +1700,16 @@ class MiniQuotaCard(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self._dragging:
             was_drag = self._drag_moved
+            pressed_pod = self._pressed_pod
             self._dragging = False
             self._drag_moved = False
+            self._pressed_pod = None
+            if pressed_pod:
+                self._start_pod_bounce(pressed_pod)
             if was_drag:
                 self.drag_finished.emit(self.x(), self.y())
             else:
-                pods = [p for p in ("antigravity", "codex") if p in self._pinned_pods] or ["antigravity"]
-                if len(pods) == 1:
-                    target = pods[0]
-                else:
-                    mid_x = SHADOW_MARGIN + self._calc_vis_width() / 2.0
-                    target = pods[0] if event.pos().x() < mid_x else pods[1]
+                target = pressed_pod or self._hit_test_pod(event.pos())
                 self.pod_clicked.emit(target)
             event.accept()
             return
